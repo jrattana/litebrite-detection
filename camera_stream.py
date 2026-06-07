@@ -9,6 +9,7 @@ import json
 import time
 import threading
 import sys
+import urllib.request
 sys.path.insert(0, '/home/jerica')
 from undistort import Undistorter
 
@@ -17,8 +18,9 @@ from undistort import Undistorter
 #   1-bit: 1 1 0  → T1H=833ns, T1L=417ns
 #   0-bit: 1 0 0  → T0H=417ns, T0L=833ns
 # 8 WS bits packed into 3 SPI bytes → 9 SPI bytes per 24-bit pixel
-LED_OFFSET = 4   # first 4 LEDs have a broken DIN trace; keep them black
-LED_COUNT  = 53
+LED_OFFSET = 0   # new WS2815 strip: drive from the first LED
+LED_COUNT  = 460
+led_color  = (0, 0, 0)   # last colour set via /set_led; restored after the win sequence
 
 def _encode_color_byte(v):
     """Encode one 8-bit color channel into 3 SPI bytes (3 SPI bits per WS bit)."""
@@ -38,7 +40,7 @@ try:
     import spidev as _spidev
     _spi = _spidev.SpiDev()
     _spi.open(0, 0)
-    _spi.max_speed_hz = 2400000
+    _spi.max_speed_hz = 1200000
     _spi.mode = 0
     LED_AVAILABLE = True
     def _spi_show(r, g, b):
@@ -48,8 +50,11 @@ try:
                 buf += _encode_pixel(0, 0, 0)
             else:
                 buf += _encode_pixel(r, g, b)
-        buf += [0x00] * 100   # reset: >280µs low (100 × 3.3µs = 333µs)
-        _spi.xfer2(buf)
+        buf += [0x00] * 160   # reset: >280µs low (160 × ~2.67µs = 427µs @3MHz)
+        try:
+            _spi.xfer2(buf)
+        except Exception as e:
+            print(f"LED xfer2 failed: {e}")
     _spi_show(0, 0, 0)   # clear on startup
 except Exception as e:
     print(f"LED init failed: {e}")
@@ -80,6 +85,7 @@ time.sleep(1)
 fov_pct      = 100
 output_hfov  = 60.0
 undistort_on = True
+focus_pos    = 0.0    # 0 = autofocus; >0 = manual lens position (dioptres)
 undistorter  = Undistorter(width=IMG_W, height=IMG_H,
                            input_hfov_deg=INPUT_HFOV,
                            output_hfov_deg=output_hfov)
@@ -112,11 +118,50 @@ def _save_settings(key, value):
         print(f"Settings save failed: {e}")
 
 _settings = _load_settings()
-diff_threshold     = _settings.get("diff_threshold", 20)
+diff_threshold     = _settings.get("diff_threshold", 20)   # absolute thr, used by /scan_holes diagnostic
+adapt_margin       = _settings.get("adapt_margin", 30)     # live detection: margin above local background = filled
 last_scan_results  = []   # most recent scan_holes result list
+
+# ── Template store ────────────────────────────────────
+TEMPLATES_FILE = "/home/jerica/templates.json"
+
+def _load_templates():
+    try:
+        with open(TEMPLATES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _atomic_write_json(path, obj):
+    """Write JSON atomically: temp file in the same dir, then os.replace().
+    A rename only needs write permission on the directory, so this can
+    overwrite a target owned by another user (e.g. a stale root-owned file)."""
+    import os, tempfile
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp_calib_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def _save_templates_to_disk(templates):
+    try:
+        with open(TEMPLATES_FILE, "w") as f:
+            json.dump(templates, f)
+    except Exception as e:
+        print(f"Templates save failed: {e}")
 
 # ── Pattern detection state ───────────────────────────
 target_pattern               = set()   # hole indices that must be filled
+current_template             = None    # name of loaded template (identity for win trigger)
+last_trigger                 = None    # summary dict of last win-trigger send (for status)
 consecutive_matches          = 0
 puzzle_solved                = False
 detection_running            = False
@@ -124,6 +169,22 @@ detection_strict             = False   # True = background nodes must also be em
 detection_live_state         = {}      # idx -> bool (last frame's per-hole result)
 detection_last_diffs         = {}      # idx -> float (last frame's raw diffs, for debug)
 REQUIRED_CONSECUTIVE_MATCHES = 10
+NODE_DEBOUNCE_FRAMES         = 2     # consecutive confirming frames required to flip a node
+HYST_FRACTION                = 0.15  # hysteresis half-gap as a fraction of diff_threshold
+HYST_MIN_MARGIN              = 6     # floor for the half-gap, in luminance counts
+ADAPT_BASELINE_PCTL          = 30    # local background = this percentile of nearby-hole diffs
+ADAPT_RADIUS_FACTOR          = 2.2   # baseline window radius, in units of col_dx
+ADAPT_MIN_DIFF               = 8    # absolute floor a peg must clear regardless of local baseline
+NEIGHBOR_FILL_FRAC           = 0.6   # fraction of in-pattern neighbors filled to infer a missed peg
+NEIGHBOR_MIN_FILLED          = 2     # ...and at least this many (so edge holes are not filled on one)
+
+# Fixed camera exposure during detection. Auto-exposure lets the IR-on frame
+# (plus bright LED backlight) clip the sensor at the top of the board, which
+# collapses the IR differential to ~0 so filled pegs read as empty. A fixed,
+# lower exposure keeps headroom so peg-vs-empty contrast survives everywhere.
+DETECT_EXPOSURE_US           = 12000  # microseconds (~1/83s); no clipping, strong IR signal
+DETECT_GAIN                  = 1.0    # lowest analogue gain = least sensor noise
+detection_inferred           = []    # idx list: pattern nodes filled by neighbor inference (for UI)
 
 def apply_crop(pct):
     w = int(SENSOR_W * pct / 100)
@@ -132,9 +193,52 @@ def apply_crop(pct):
     y = (SENSOR_H - h) // 2
     camera.set_controls({"ScalerCrop": (x, y, w, h)})
 
+def _apply_calibration(data):
+    """Apply a loaded calibration dict (or legacy bare list) to live state.
+    Sets grid_holes + camera globals, applies crop/undistorter/focus.
+    Returns the applied values for JSON responses."""
+    global grid_holes, fov_pct, output_hfov, undistort_on, focus_pos, undistorter
+    cam   = data if isinstance(data, dict) else {}
+    holes = data.get("holes", []) if isinstance(data, dict) else data  # legacy list
+    with state_lock:
+        grid_holes = holes
+    if "fov_pct" in cam:
+        fov_pct = int(cam["fov_pct"]); apply_crop(fov_pct)
+    if "output_hfov" in cam:
+        output_hfov = float(cam["output_hfov"])
+        new_und = Undistorter(width=IMG_W, height=IMG_H,
+                              input_hfov_deg=INPUT_HFOV, output_hfov_deg=output_hfov)
+        with state_lock:
+            undistorter = new_und
+    if "undistort_on" in cam:
+        with state_lock:
+            undistort_on = bool(cam["undistort_on"])
+    if "focus" in cam:
+        focus_pos = float(cam["focus"])
+        if focus_pos <= 0:
+            camera.set_controls({"AfMode": controls.AfModeEnum.Continuous,
+                                 "AfSpeed": controls.AfSpeedEnum.Fast,
+                                 "AfRange": controls.AfRangeEnum.Macro})
+        else:
+            camera.set_controls({"AfMode": controls.AfModeEnum.Manual,
+                                 "LensPosition": focus_pos})
+    return {"count": len(holes), "holes": holes, "fov_pct": fov_pct,
+            "output_hfov": output_hfov, "undistort_on": undistort_on, "focus": focus_pos}
+
+
 apply_crop(fov_pct)
 camera.set_controls({"AfMode": controls.AfModeEnum.Continuous,
                      "AfSpeed": controls.AfSpeedEnum.Fast})
+
+# Auto-restore saved calibration on startup (survives stream restarts)
+try:
+    with open("/home/jerica/grid_holes.json") as f:
+        _apply_calibration(json.load(f))
+    print(f"Calibration restored: {len(grid_holes)} holes")
+except FileNotFoundError:
+    print("No saved calibration found at boot")
+except Exception as e:
+    print(f"Boot calibration load failed: {e}")
 
 
 def capture_loop():
@@ -248,7 +352,84 @@ def _win_animation():
             _spi_show(0, v, 0)
             time.sleep(0.008)
 
-    _spi_show(0, 0, 0)
+    # Return to the colour the LED was set at before the win
+    _spi_show(*led_color)
+
+
+def _set_current_template(name):
+    """Record which template/pattern is currently loaded (identity source for the win trigger)."""
+    global current_template
+    with state_lock:
+        current_template = name
+
+
+def _send_win_trigger(code, url=None):
+    """POST a single-letter win code to the external receiver. Non-blocking; never raises.
+    `url` overrides the global win_trigger.url (per-template routing); falls back to it."""
+    global last_trigger
+    cfg = (_load_settings().get("win_trigger") or {})
+    url = url or cfg.get("url")
+    if not cfg.get("enabled", False) or not url:
+        last_trigger = {"time": time.strftime("%H:%M:%S"), "code": code,
+                        "ok": False, "err": "disabled or no url"}
+        print(f"[win_trigger] skipped (disabled/no url) code={code!r}")
+        return
+    timeout = float(cfg.get("timeout_s", 2.0))
+    retries = int(cfg.get("retries", 1))
+    payload = { cfg.get("field_code", "code"): code }
+    body = json.dumps(payload).encode()
+
+    def _worker():
+        global last_trigger
+        err = None
+        for _ in range(max(1, retries + 1)):
+            try:
+                req = urllib.request.Request(
+                    url, data=body,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    rc = resp.getcode()
+                last_trigger = {"time": time.strftime("%H:%M:%S"), "code": code,
+                                "ok": True, "status": rc, "url": url}
+                print(f"[win_trigger] sent code={code!r} -> {url} ({rc})")
+                return
+            except Exception as e:
+                err = str(e)
+                time.sleep(0.2)
+        last_trigger = {"time": time.strftime("%H:%M:%S"), "code": code,
+                        "ok": False, "err": err, "url": url}
+        print(f"[win_trigger] FAILED code={code!r} -> {url}: {err}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _resolve_pattern_entry(entry):
+    """A pattern_map value is either a code string or a {code, url} dict. -> (code, url|None)."""
+    if isinstance(entry, dict):
+        return entry.get("code"), entry.get("url")
+    return entry, None
+
+
+def _fire_win_trigger_for_current():
+    """Look up the loaded template's identity in pattern_map and fire the trigger once."""
+    with state_lock:
+        tmpl = current_template
+    entry = (_load_settings().get("pattern_map") or {}).get(tmpl)
+    code, url = _resolve_pattern_entry(entry)
+    if code:
+        _send_win_trigger(code, url)
+    else:
+        print(f"[win_trigger] win but no pattern_map entry for template={tmpl!r}; skipped")
+
+
+def _win_then_reset():
+    """Run win animation then auto-reset for next participant."""
+    _fire_win_trigger_for_current()
+    _win_animation()
+    global consecutive_matches, puzzle_solved
+    with state_lock:
+        consecutive_matches = 0
+        puzzle_solved       = False
 
 
 def detection_loop():
@@ -258,7 +439,7 @@ def detection_loop():
     target vs background nodes, and increments a consecutive-match counter.
     Triggers win state when REQUIRED_CONSECUTIVE_MATCHES frames all match.
     """
-    global consecutive_matches, puzzle_solved, detection_running, detection_last_diffs, detection_live_state
+    global consecutive_matches, puzzle_solved, detection_running, detection_last_diffs, detection_live_state, detection_inferred
 
     with state_lock:
         holes   = list(grid_holes)
@@ -270,9 +451,47 @@ def detection_loop():
             detection_running = False
         return
 
-    # Lock auto-exposure once for the whole detection session
-    camera.set_controls({"AeEnable": False})
-    time.sleep(0.15)
+    # Lock AE + fix exposure low enough to avoid sensor clipping (see DETECT_EXPOSURE_US).
+    camera.set_controls({"AeEnable": False,
+                         "ExposureTime": DETECT_EXPOSURE_US,
+                         "AnalogueGain": DETECT_GAIN})
+    time.sleep(0.5)   # exposure change needs several frames to settle
+
+    # Persistent per-node state for hysteresis + temporal debounce
+    node_state   = {}   # idx -> bool: committed (debounced) filled/empty
+    node_pending = {}   # idx -> int:  consecutive frames the pending flip has held
+
+    # ── Precompute lattice geometry once (holes fixed for this session) ──
+    _bins = {}
+    for _h in holes:
+        _bins.setdefault(int(round(_h["py"] / 20)), []).append(_h["px"])
+    _dxs = []
+    for _xs in _bins.values():
+        _xs_s = sorted(_xs)
+        for _j in range(len(_xs_s) - 1):
+            _d = _xs_s[_j + 1] - _xs_s[_j]
+            if _d > 5:
+                _dxs.append(_d)
+    col_dx = float(np.median(_dxs)) if _dxs else 50.0
+
+    _pts      = [(int(round(h["px"])), int(round(h["py"]))) for h in holes]
+    _n        = len(_pts)
+    nb_lo     = (0.55 * col_dx) ** 2
+    nb_hi     = (1.45 * col_dx) ** 2
+    base_r2   = (ADAPT_RADIUS_FACTOR * col_dx) ** 2
+    neighbors = [[] for _ in range(_n)]
+    base_win  = [[] for _ in range(_n)]
+    for _a in range(_n):
+        _ax, _ay = _pts[_a]
+        for _b in range(_a + 1, _n):
+            _bx, _by = _pts[_b]
+            _d2 = (_bx - _ax) ** 2 + (_by - _ay) ** 2
+            if _d2 <= base_r2:
+                base_win[_a].append(_b)
+                base_win[_b].append(_a)
+                if nb_lo <= _d2 <= nb_hi:
+                    neighbors[_a].append(_b)
+                    neighbors[_b].append(_a)
 
     try:
         while True:
@@ -298,41 +517,86 @@ def detection_loop():
             img_on  = np.array(Image.open(io.BytesIO(frame_on)))
             img_off = np.array(Image.open(io.BytesIO(frame_off)))
 
-            # ── Compute per-hole IR diffs ────────────────────
+            # ── Compute per-hole IR diffs (parallax-aware) ───
+            # Off-axis pegs sit off the calibrated hole centre (camera looks up
+            # at a board with depth). Instead of sampling only the centre patch,
+            # compute the whole-frame smoothed IR differential once and take the
+            # MAX within a small search window around each hole, so the peg is
+            # captured wherever parallax has shifted it. Radius is capped below
+            # half the lattice step so a window can never reach an adjacent hole.
+            _lon  = (0.299 * img_on[..., 0]  + 0.587 * img_on[..., 1]  + 0.114 * img_on[..., 2]).astype(np.float32)
+            _loff = (0.299 * img_off[..., 0] + 0.587 * img_off[..., 1] + 0.114 * img_off[..., 2]).astype(np.float32)
+            dimg  = cv2.blur(_lon - _loff, (9, 9))   # ~8x8 patch mean, matches _hole_lum
+            _H, _W = dimg.shape
+            SEARCH_R = int(max(3, min(0.35 * col_dx, 0.45 * col_dx)))
             diffs = {}
             for i, hole in enumerate(holes):
                 px = int(round(hole["px"]))
                 py = int(round(hole["py"]))
-                diffs[i] = _hole_lum(img_on, px, py) - _hole_lum(img_off, px, py)
+                x1 = max(0, px - SEARCH_R); x2 = min(_W, px + SEARCH_R + 1)
+                y1 = max(0, py - SEARCH_R); y2 = min(_H, py + SEARCH_R + 1)
+                if x2 <= x1 or y2 <= y1:
+                    diffs[i] = 0.0
+                else:
+                    diffs[i] = float(dimg[y1:y2, x1:x2].max())
 
-            # ── Evaluate pattern match (fast-fail) ──────────
+            # ── Evaluate pattern match (adaptive + neighbor fill-in) ──
             with state_lock:
-                strict  = detection_strict
-                pattern = set(target_pattern)
+                strict   = detection_strict
+                pattern  = set(target_pattern)
+                a_margin = adapt_margin
 
             all_idx    = set(range(len(holes)))
             background = all_idx - pattern
-            is_match   = True
-            live       = {}
 
-            # Target nodes must be FILLED (diff > thresh)
+            def _adapt_band(i):
+                # Per-hole threshold: a peg must stand out from its LOCAL background.
+                win = [diffs[j] for j in base_win[i]] or [diffs.get(i, 0)]
+                baseline = float(np.percentile(win, ADAPT_BASELINE_PCTL))
+                on_i = max(ADAPT_MIN_DIFF, baseline + a_margin)
+                hyst = max(HYST_MIN_MARGIN, on_i * HYST_FRACTION)
+                return on_i, on_i - hyst
+
+            def _step_node(i, d):
+                # Debounced hysteresis against the hole's own adaptive band.
+                on_i, off_i = _adapt_band(i)
+                cur  = node_state.get(i, False)
+                want = (d > on_i) if not cur else (d > off_i)
+                if want != cur:
+                    node_pending[i] = node_pending.get(i, 0) + 1
+                    if node_pending[i] >= NODE_DEBOUNCE_FRAMES:
+                        node_state[i]   = want
+                        node_pending[i] = 0
+                else:
+                    node_pending[i] = 0
+                return node_state.get(i, False)
+
+            # Step every target node (debounced, adaptive)
+            measured = {i: _step_node(i, diffs.get(i, 0)) for i in pattern}
+
+            # ── Neighbor fill-in: recover pegs missed INSIDE a filled cluster ──
+            inferred = set()
             for i in pattern:
-                ok = diffs.get(i, 0) > thresh
-                live[i] = ok
-                if not ok:
-                    is_match = False
-                    # don't break — keep collecting live state for UI
+                if measured[i]:
+                    continue
+                pn = [j for j in neighbors[i] if j in pattern]
+                fn = sum(1 for j in pn if measured[j])
+                if pn and fn >= NEIGHBOR_MIN_FILLED and fn >= len(pn) * NEIGHBOR_FILL_FRAC:
+                    inferred.add(i)
 
-            # Background nodes must be EMPTY (diff ≤ thresh) — only in strict mode
-            if strict and is_match:
+            live     = {i: (measured[i] or (i in inferred)) for i in pattern}
+            is_match = len(pattern) > 0 and all(live.values())
+
+            # Background nodes must be EMPTY (debounced) — only in strict mode
+            if strict:
                 for i in background:
-                    if diffs.get(i, 0) > thresh:
+                    if _step_node(i, diffs.get(i, 0)) and is_match:
                         is_match = False
-                        break
 
             with state_lock:
                 detection_live_state = live
                 detection_last_diffs = dict(diffs)
+                detection_inferred   = list(inferred)
 
             # ── Debounce counter ─────────────────────────────
             with state_lock:
@@ -342,7 +606,7 @@ def detection_loop():
                     if (consecutive_matches >= REQUIRED_CONSECUTIVE_MATCHES
                             and not puzzle_solved):
                         puzzle_solved = True
-                        threading.Thread(target=_win_animation, daemon=True).start()
+                        threading.Thread(target=_win_then_reset, daemon=True).start()
                 else:
                     consecutive_matches = 0
                     if puzzle_solved:
@@ -424,23 +688,31 @@ PAGE = """
   <div class="sep"></div>
   <button id="btnCalib" onclick="startCalib()" style="background:#444;color:#fff">📐 Calibrate</button>
   <button onclick="loadSavedGrid()" style="background:#444;color:#fff">📂 Load Last</button>
+  <button id="btnSaveCalib" onclick="saveCalibration()" style="background:#444;color:#fff;display:none">💾 Save Calibration</button>
   <button id="btnDone" onclick="phaseDone()" style="display:none;background:#363;color:#afa">✓ Done</button>
   <span id="calibStatus" style="font-size:12px;color:#fa0;"></span>
   <button id="btnScan" onclick="scanHoles()" style="display:none;background:#26a;color:#fff">🔍 Scan</button>
-  <button id="btnTriangle" onclick="detectTriangles()" style="display:none;background:#550;color:#ff0">🔺 Triangles</button>
-  <button id="btnPattern" onclick="togglePatternMode()" style="display:none;background:#444;color:#fff">🎯 Set Pattern</button>
+  <button id="btnDetectTmpl" onclick="detectTemplate()" style="display:none;background:#0a5;color:#fff;font-weight:bold">🔍 Detect Template</button>
+  <div id="tmplDropWrap" style="position:relative;display:none">
+    <button onclick="toggleTmplDropdown()" style="background:#444;color:#fff">📋 Templates ▾</button>
+    <div id="tmplDropdown" style="display:none;position:absolute;top:100%;left:0;background:#222;
+         border:1px solid #555;border-radius:5px;min-width:180px;z-index:200;padding:4px 0;">
+      <div id="tmplList"></div>
+      <hr style="border-color:#444;margin:4px 0">
+      <div style="padding:4px 10px;cursor:pointer;font-size:12px;color:#4af"
+           onclick="promptSaveTemplate()">➕ Save current scan as template…</div>
+    </div>
+  </div>
+  <button id="btnSelectHoles" onclick="toggleSelectMode()" style="display:none;background:#444;color:#fff">🎯 Select Holes</button>
   <button id="btnDetect" onclick="toggleDetection()" style="display:none;background:#444;color:#fff">▶ Detect</button>
-  <label style="font-size:11px;color:#aaa;white-space:nowrap">
-    <input type="checkbox" id="chkStrict" onchange="setStrict(this.checked)" style="vertical-align:middle"> Strict
-  </label>
   <span id="detectBar" style="font-size:12px;color:#afa;font-family:monospace;white-space:nowrap;"></span>
   <button id="btnClearGrid" onclick="clearGrid()" style="display:none;background:#444;color:#fff">✕</button>
   <div class="sep"></div>
   <label>IR Sensitivity
-    <input type="range" id="diffSlider" min="0" max="255" value="20"
+    <input type="range" id="diffSlider" min="0" max="120" value="30"
            style="width:90px;accent-color:#0f0;vertical-align:middle"
            oninput="onDiffChange(this.value)">
-    <span id="diffVal">20</span>
+    <span id="diffVal">30</span>
   </label>
   <div class="sep"></div>
   <label>LED
@@ -467,10 +739,7 @@ PAGE = """
      flex-direction:column;gap:20px;">
   <div style="font-size:72px">🎉</div>
   <div style="font-size:44px;color:#ffe000;font-weight:bold;letter-spacing:2px">PUZZLE SOLVED!</div>
-  <button onclick="resetPuzzle()" style="padding:14px 36px;font-size:18px;background:#26a;
-          color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold;margin-top:12px">
-    ▶ Play Again
-  </button>
+  <div id="winResetMsg" style="font-size:18px;color:#aaa;display:none">Resetting for next player…</div>
 </div>
 
 <script>
@@ -538,6 +807,16 @@ PAGE = """
   // ── Canvas overlay ─────────────────────────────────
   const IMG_W = 2304, IMG_H = 1296;
   const streamImg = document.getElementById('stream');
+  // Auto-load saved calibration into the overlay once on initial page load
+  let _autoLoadedGrid = false;
+  function _autoLoadGridOnce() {
+    if (_autoLoadedGrid) return;
+    _autoLoadedGrid = true;
+    loadSavedGrid();   // 404 path sets a harmless status; safe if no calibration exists
+  }
+  streamImg.addEventListener('load', _autoLoadGridOnce);
+  // If the MJPEG frame already arrived before this listener attached, fire now
+  if (streamImg.complete && streamImg.naturalWidth > 0) _autoLoadGridOnce();
   const wrap      = document.getElementById('imgWrap');
   const overlay   = document.getElementById('overlay');
 
@@ -609,23 +888,26 @@ PAGE = """
     if (detectPollId)  { clearInterval(detectPollId); detectPollId = null; }
     calibPhase = PHASE_NONE;
     rowLines = []; colLines = []; lineStart = null; holeState = []; triangleData = [];
-    patternSet.clear(); patternMode = false;
+    patternSet = new Set(); patternMode = false;
+    loadedTemplateName = null; liveState = {}; wasSolved = false;
     wrap.classList.remove('calib-mode');
-    document.getElementById('btnDone').style.display         = 'none';
-    document.getElementById('btnScan').style.display         = 'none';
-    document.getElementById('btnTriangle').style.display     = 'none';
-    document.getElementById('btnPattern').style.display      = 'none';
-    document.getElementById('btnDetect').style.display       = 'none';
-    document.getElementById('detectBar').textContent         = '';
-    document.getElementById('btnClearGrid').style.display    = 'none';
+    document.getElementById('btnDone').style.display           = 'none';
+    document.getElementById('btnScan').style.display           = 'none';
+    document.getElementById('btnDetectTmpl').style.display     = 'none';
+    document.getElementById('tmplDropWrap').style.display      = 'none';
+    document.getElementById('btnSelectHoles').style.display    = 'none';
+    document.getElementById('btnDetect').style.display         = 'none';
+    document.getElementById('detectBar').textContent           = '';
+    document.getElementById('btnClearGrid').style.display      = 'none';
+    document.getElementById('winOverlay').style.display        = 'none';
     setStatus('');
     redrawOverlay();
   }
 
   // ── Line drawing: first click = start, second click = commit ──
   wrap.addEventListener('click', e => {
-    // Pattern mode: click a hole to toggle it as a target
-    if (patternMode && holeState.length > 0) {
+    // Select mode: click a hole to toggle it as a target
+    if ((patternMode || selectMode) && holeState.length > 0) {
       const rect = wrap.getBoundingClientRect();
       const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
       const sx = streamImg.offsetWidth / IMG_W, sy = streamImg.offsetHeight / IMG_H;
@@ -636,13 +918,20 @@ PAGE = """
       });
       if (best >= 0) {
         const idx = holeState[best].idx;
-        fetch('/toggle_pattern_node?idx=' + idx).then(r => r.json()).then(d => {
-          if (d.state === 'added') patternSet.add(idx); else patternSet.delete(idx);
-          const btn = document.getElementById('btnDetect');
-          btn.style.display = patternSet.size > 0 ? '' : 'none';
-          setStatus('🎯 Pattern: ' + patternSet.size + ' target node' + (patternSet.size !== 1 ? 's' : '') + ' — click ▶ Detect when ready');
+        if (selectMode) {
+          // In select mode: toggle locally, no backend call needed yet
+          if (patternSet.has(idx)) patternSet.delete(idx); else patternSet.add(idx);
+          setStatus('🎯 ' + patternSet.size + ' holes selected — click ✓ Done Selecting when finished');
           redrawOverlay();
-        });
+        } else {
+          fetch('/toggle_pattern_node?idx=' + idx).then(r => r.json()).then(d => {
+            if (d.state === 'added') patternSet.add(idx); else patternSet.delete(idx);
+            const btn = document.getElementById('btnDetect');
+            btn.style.display = patternSet.size > 0 ? '' : 'none';
+            setStatus('🎯 Pattern: ' + patternSet.size + ' target node' + (patternSet.size !== 1 ? 's' : '') + ' — click ▶ Detect when ready');
+            redrawOverlay();
+          });
+        }
       }
       return;
     }
@@ -704,10 +993,11 @@ PAGE = """
     }).then(r => r.json()).then(d => {
       holeState = d.holes.map((h, i) => ({ px: h.px, py: h.py, occupied: null, idx: i }));
       triangleData = []; patternSet.clear();
-      setStatus('✓ ' + d.count + ' holes mapped — click 🔍 Scan');
-      document.getElementById('btnScan').style.display         = '';
-      document.getElementById('btnPattern').style.display      = '';
-      document.getElementById('btnTriangle').style.display     = 'none';
+      setStatus('✓ ' + d.count + ' holes mapped — click 🔍 Detect Template');
+      document.getElementById('btnScan').style.display         = 'none';
+      document.getElementById('btnDetectTmpl').style.display   = '';
+      document.getElementById('tmplDropWrap').style.display    = '';
+      document.getElementById('btnSelectHoles').style.display  = '';
       document.getElementById('btnDetect').style.display       = 'none';
       document.getElementById('btnClearGrid').style.display    = '';
       redrawOverlay();
@@ -720,20 +1010,62 @@ PAGE = """
       if (d.error) { setStatus('✗ ' + d.error); return; }
       holeState = d.holes.map((h, i) => ({ px: h.px, py: h.py, occupied: null, idx: i }));
       triangleData = []; patternSet.clear();
-      setStatus('✓ ' + d.count + ' holes loaded — click 🔍 Scan');
-      document.getElementById('btnScan').style.display         = '';
-      document.getElementById('btnPattern').style.display      = '';
-      document.getElementById('btnTriangle').style.display     = 'none';
+      // ── Sync stream-control UI to the restored camera settings ──
+      if (d.fov_pct !== undefined) {
+        document.getElementById('fov').value = d.fov_pct;
+        document.getElementById('fovVal').textContent = d.fov_pct + '%';
+      }
+      if (d.output_hfov !== undefined) {
+        document.getElementById('ofov').value = d.output_hfov;
+        document.getElementById('ofovVal').textContent = Math.round(d.output_hfov) + '°';
+      }
+      if (d.undistort_on !== undefined) {
+        const ub = document.getElementById('undistBtn');
+        ub.textContent      = '🔭 Undistort: ' + (d.undistort_on ? 'ON' : 'OFF');
+        ub.style.background = d.undistort_on ? '#363' : '#444';
+        ub.style.color      = d.undistort_on ? '#afa' : '#fff';
+      }
+      if (d.focus !== undefined) {
+        document.getElementById('focusSlider').value = d.focus;
+        document.getElementById('focusVal').textContent =
+          d.focus === 0 ? 'auto' : d.focus.toFixed(1) + ' D';
+      }
+      document.getElementById('btnSaveCalib').style.display = '';
+      setStatus('✓ ' + d.count + ' holes loaded — click 🔍 Detect Template');
+      document.getElementById('btnScan').style.display         = 'none';
+      document.getElementById('btnDetectTmpl').style.display   = '';
+      document.getElementById('tmplDropWrap').style.display    = '';
+      document.getElementById('btnSelectHoles').style.display  = '';
       document.getElementById('btnDetect').style.display       = 'none';
       document.getElementById('btnClearGrid').style.display    = '';
       redrawOverlay();
     }).catch(() => { setStatus('✗ Load failed'); });
   }
 
+  function saveCalibration() {
+    setStatus('⏳ Saving calibration + camera settings…');
+    fetch('/save_calibration', {method:'POST'}).then(r => r.json()).then(d => {
+      if (d.error) { setStatus('✗ ' + d.error); return; }
+      const f = d.focus === 0 ? 'auto' : d.focus.toFixed(1) + ' D';
+      setStatus('💾 Saved ' + d.count + ' holes  ·  FOV ' + d.fov_pct + '%  ·  focus ' + f +
+                '  ·  undistort ' + (d.undistort_on ? 'ON' : 'OFF'));
+    }).catch(() => { setStatus('✗ Save failed'); });
+  }
+
   function onDiffChange(v) {
     document.getElementById('diffVal').textContent = v;
-    fetch('/set_diff_threshold?val=' + v);
+    fetch('/set_adapt_margin?val=' + v);
   }
+
+  // Sync the IR Sensitivity slider to the persisted backend value on page load
+  window.addEventListener('load', () => {
+    fetch('/detection_status').then(r => r.json()).then(d => {
+      if (d.adapt_margin !== undefined) {
+        document.getElementById('diffSlider').value = d.adapt_margin;
+        document.getElementById('diffVal').textContent = d.adapt_margin;
+      }
+    }).catch(() => {});
+  });
 
   function scanHoles() {
     setStatus('⏳ Scanning…');
@@ -764,23 +1096,157 @@ PAGE = """
     }).catch(() => { setStatus('✗ Triangle detection failed'); });
   }
 
-  // ── Pattern & Detection ───────────────────────────
-  function togglePatternMode() {
-    patternMode = !patternMode;
-    const btn = document.getElementById('btnPattern');
-    btn.textContent      = patternMode ? '✓ Done' : '🎯 Set Pattern';
-    btn.style.background = patternMode ? '#363' : '#444';
-    btn.style.color      = patternMode ? '#afa' : '#fff';
-    if (patternMode) {
-      setStatus('🎯 Click holes to mark as targets — magenta = must be filled');
-    } else if (patternSet.size > 0) {
-      setStatus('🎯 ' + patternSet.size + ' targets set — click ▶ Detect to start');
+  // ── Template detection & hole selection ─────────
+  let loadedTemplateName = null;
+  let selectMode = false;
+  let editingTemplate = null;   // name of template currently being edited (for overwrite-save)
+
+  function toggleSelectMode() {
+    selectMode = !selectMode;
+    const btn = document.getElementById('btnSelectHoles');
+    btn.textContent      = selectMode ? '✓ Done Selecting' : '🎯 Select Holes';
+    btn.style.background = selectMode ? '#363' : '#444';
+    btn.style.color      = selectMode ? '#afa' : '#fff';
+    if (selectMode) {
+      patternSet = new Set();
+      editingTemplate = null;
+      setStatus('🎯 Click holes to mark template — cyan = selected. Click ✓ Done Selecting when finished, then save via 📋 Templates ▾');
     } else {
-      setStatus('');
+      if (patternSet.size > 0) {
+        setStatus('✓ ' + patternSet.size + ' holes selected — save via 📋 Templates ▾ or click ▶ Detect');
+        document.getElementById('btnDetect').style.display = '';
+      } else {
+        setStatus('');
+      }
     }
     redrawOverlay();
   }
 
+  function detectTemplate() {
+    setStatus('⏳ Scanning for template…');
+    fetch('/detect_template').then(r => r.json()).then(d => {
+      if (d.error) { setStatus('✗ ' + d.error); return; }
+      if (!d.hole_count) {
+        setStatus('⚠ No template detected — place template on board and try again');
+        return;
+      }
+      loadedTemplateName = d.match ? d.match.name : null;
+      // Update patternSet for overlay rendering
+      patternSet = new Set(d.open_holes);
+      holeState.forEach(h => { h.occupied = null; });
+      if (d.match) {
+        setStatus('✓ ' + d.match.name + ' detected (' + Math.round(d.match.score*100) + '% match) — ' + d.hole_count + ' holes  →  click ▶ Detect');
+      } else {
+        setStatus('✓ Template detected — ' + d.hole_count + ' holes (no saved match)  →  click ▶ Detect');
+      }
+      document.getElementById('btnDetect').style.display = '';
+      redrawOverlay();
+    }).catch(() => { setStatus('✗ Detect failed'); });
+  }
+
+  function toggleTmplDropdown() {
+    const dd = document.getElementById('tmplDropdown');
+    if (dd.style.display === 'none') {
+      refreshTmplList();
+      dd.style.display = '';
+      // close on outside click
+      setTimeout(() => document.addEventListener('click', closeTmplDropdown, {once:true}), 50);
+    } else {
+      dd.style.display = 'none';
+    }
+  }
+
+  function closeTmplDropdown() {
+    document.getElementById('tmplDropdown').style.display = 'none';
+  }
+
+  function refreshTmplList() {
+    fetch('/templates').then(r => r.json()).then(list => {
+      const el = document.getElementById('tmplList');
+      if (!list.length) {
+        el.innerHTML = '<div style="padding:6px 10px;font-size:12px;color:#888">No templates saved yet</div>';
+        return;
+      }
+      el.innerHTML = list.map(t => {
+        const n = t.name.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+        return '<div style="display:flex;align-items:center;padding:4px 10px;gap:8px;">' +
+          '<span style="flex:1;cursor:pointer;font-size:12px" data-tmpl="' + n + '" onclick="loadTmpl(this.dataset.tmpl)">' +
+            t.name + ' <span style="color:#888">(' + t.hole_count + ' holes)</span></span>' +
+          '<span style="cursor:pointer;color:#4af;font-size:13px" data-tmpl="' + n + '" onclick="editTmpl(this.dataset.tmpl)">&#x270E;</span>' +
+          '<span style="cursor:pointer;color:#a33;font-size:11px" data-tmpl="' + n + '" onclick="deleteTmpl(this.dataset.tmpl)">&#x1F5D1;</span>' +
+        '</div>';
+      }).join('');
+    });
+  }
+
+  function loadTmpl(name) {
+    document.getElementById('tmplDropdown').style.display = 'none';
+    fetch('/load_template', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({name})}).then(r => r.json()).then(d => {
+      if (d.error) { setStatus('✗ ' + d.error); return; }
+      loadedTemplateName = name;
+      setStatus('✓ Loaded: ' + name + ' (' + d.hole_count + ' holes)  →  click ▶ Detect');
+      patternSet = new Set(d.holes || []);
+      document.getElementById('btnDetect').style.display = '';
+      redrawOverlay();
+    });
+  }
+
+  function editTmpl(name) {
+    document.getElementById('tmplDropdown').style.display = 'none';
+    fetch('/load_template', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({name})}).then(r => r.json()).then(d => {
+      if (d.error) { setStatus('✗ ' + d.error); return; }
+      patternSet      = new Set(d.holes || []);
+      editingTemplate = name;
+      loadedTemplateName = name;
+      selectMode      = true;                       // enter select mode WITHOUT clearing
+      const btn = document.getElementById('btnSelectHoles');
+      btn.style.display   = '';
+      btn.textContent     = '✓ Done Selecting';
+      btn.style.background = '#363'; btn.style.color = '#afa';
+      setStatus('✎ Editing "' + name + '" (' + patternSet.size + ' holes) — click holes to add/remove, then save via 📋 Templates ▾ (overwrites "' + name + '")');
+      redrawOverlay();
+    }).catch(() => { setStatus('✗ Edit load failed'); });
+  }
+
+  function deleteTmpl(name) {
+    if (!confirm('Delete template "' + name + '"?')) return;
+    fetch('/delete_template', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({name})}).then(() => refreshTmplList());
+  }
+
+  function promptSaveTemplate() {
+    document.getElementById('tmplDropdown').style.display = 'none';
+    const _msg = patternSet.size > 0
+      ? 'Save ' + patternSet.size + ' selected holes as template — enter name' + (editingTemplate ? ' (overwrites "' + editingTemplate + '")' : '') + ':'
+      : 'Template name (place template on board with no pegs, then enter name):';
+    const name = prompt(_msg, editingTemplate || '');
+    if (!name || !name.trim()) return;
+
+    if (patternSet.size > 0) {
+      // Save currently selected holes directly — no scan needed
+      setStatus('⏳ Saving template…');
+      fetch('/save_template_holes', {method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({name: name.trim(), holes: Array.from(patternSet)})}).then(r => r.json()).then(d => {
+        if (d.error) { setStatus('✗ ' + d.error); return; }
+        setStatus('✓ Saved template "' + d.name + '" with ' + d.hole_count + ' holes');
+        selectMode = false;
+        const btn = document.getElementById('btnSelectHoles');
+        btn.textContent = '🎯 Select Holes'; btn.style.background = '#444'; btn.style.color = '#fff';
+      }).catch(() => { setStatus('✗ Save failed'); });
+    } else {
+      // Fall back to ambient scan
+      setStatus('⏳ Scanning and saving template…');
+      fetch('/save_template', {method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({name: name.trim()})}).then(r => r.json()).then(d => {
+        if (d.error) { setStatus('✗ ' + d.error); return; }
+        setStatus('✓ Saved template "' + d.name + '" with ' + d.hole_count + ' holes');
+      }).catch(() => { setStatus('✗ Save failed'); });
+    }
+  }
+
+  // ── Detection ──────────────────────────────────────
   function toggleDetection() {
     if (detectRunning) {
       fetch('/stop_detection').then(() => {
@@ -791,17 +1257,29 @@ PAGE = """
         document.getElementById('detectBar').textContent = '';
       });
     } else {
-      fetch('/start_detection').then(r => r.json()).then(d => {
-        if (d.error) { setStatus('✗ ' + d.error); return; }
-        detectRunning = true;
-        const btn = document.getElementById('btnDetect');
-        btn.textContent = '⏹ Stop'; btn.style.background = '#a30'; btn.style.color = '#fff';
-        detectPollId = setInterval(pollDetection, 350);
+      if (patternSet.size === 0) {
+        setStatus('✗ No target pattern — 🎯 Select Holes or load a template first');
+        return;
+      }
+      // Push the browser-side target pattern to the backend, THEN start
+      fetch('/set_target_pattern', {method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({holes: Array.from(patternSet), name: loadedTemplateName})})
+        .then(r => r.json()).then(() => {
+        fetch('/start_detection').then(r => r.json()).then(d => {
+          if (d.error) { setStatus('✗ ' + d.error); return; }
+          detectRunning = true;
+          const btn = document.getElementById('btnDetect');
+          btn.textContent = '⏹ Stop'; btn.style.background = '#a30'; btn.style.color = '#fff';
+          setStatus('🔍 Detecting ' + patternSet.size + ' target holes…');
+          detectPollId = setInterval(pollDetection, 350);
+        });
       });
     }
   }
 
-  let liveState = {};   // idx -> bool from last detection poll
+  let liveState  = {};     // idx -> bool from last detection poll
+  let inferredSet = new Set();  // idx of pattern nodes filled by neighbor inference
+  let wasSolved  = false;  // track solved state transitions
 
   function pollDetection() {
     fetch('/detection_status').then(r => r.json()).then(d => {
@@ -814,23 +1292,39 @@ PAGE = """
       // Update per-hole live state for overlay
       liveState = {};
       for (const [k, v] of Object.entries(d.live_state || {})) liveState[parseInt(k)] = v;
+      inferredSet = new Set((d.inferred || []).map(Number));
 
       const total   = d.pattern_count;
       const matched = d.live_matched || 0;
       const filled  = '█'.repeat(d.consecutive_matches);
-      const empty   = '░'.repeat(d.required - d.consecutive_matches);
-      const diffInfo = d.running ? '  [avg:' + d.avg_diff + ' max:' + d.max_diff + ' thr:' + d.threshold + ']' : '';
+      const empty   = '░'.repeat(Math.max(0, d.required - d.consecutive_matches));
+      const diffInfo = d.running ? '  [avg:' + d.avg_diff + ' max:' + d.max_diff + ' mgn:' + d.adapt_margin + ']' : '';
+      const nInf     = (d.inferred || []).length;
+      const infInfo  = (d.running && nInf > 0) ? '  (+' + nInf + ' inferred)' : '';
       document.getElementById('detectBar').textContent =
-        d.solved ? '🎉 SOLVED!'
-                 : (d.running ? matched + '/' + total + ' nodes  ' + filled + empty + ' ' + d.consecutive_matches + '/' + d.required + diffInfo : '');
+        (d.running && !d.solved) ? matched + '/' + total + ' filled' + infInfo + '  ' + filled + empty + ' ' + d.consecutive_matches + '/' + d.required + diffInfo
+                                 : (d.solved ? '🎉 SOLVED!' : '');
 
-      redrawOverlay();   // refresh dots with live state
-
-      if (d.solved) {
+      // Win overlay: show on solved, auto-dismiss when backend resets
+      if (d.solved && !wasSolved) {
+        wasSolved = true;
         document.getElementById('winOverlay').style.display = 'flex';
-        clearInterval(detectPollId); detectPollId = null;
-        detectRunning = false;
+      } else if (!d.solved && wasSolved) {
+        // Backend reset after win animation — auto-dismiss
+        wasSolved = false;
+        document.getElementById('winOverlay').style.display = 'none';
+        document.getElementById('winResetMsg').style.display = 'none';
+        setStatus('🎮 Ready — place template for next player');
+        document.getElementById('detectBar').textContent = '';
+        // patternSet was auto-loaded, detection still running — clear overlay to show cyan targets
+        liveState = {};
+        redrawOverlay();
+      } else if (d.solved && wasSolved) {
+        // Show "resetting" message partway through animation
+        document.getElementById('winResetMsg').style.display = '';
       }
+
+      redrawOverlay();
     });
   }
 
@@ -841,11 +1335,8 @@ PAGE = """
   function resetPuzzle() {
     fetch('/reset_puzzle').then(() => {
       document.getElementById('winOverlay').style.display = 'none';
+      wasSolved = false;
       document.getElementById('detectBar').textContent = '';
-      detectRunning = false;
-      clearInterval(detectPollId); detectPollId = null;
-      const btn = document.getElementById('btnDetect');
-      btn.textContent = '▶ Detect'; btn.style.background = '#444'; btn.style.color = '#fff';
     });
   }
 
@@ -925,15 +1416,17 @@ PAGE = """
       holeState.forEach(h => {
         const x = h.px * sx, y = h.py * sy;
         const isTarget = patternSet.has(h.idx);
-        let color;
-        if (isTarget) {
-          // Live detection state takes priority
-          if (h.idx in liveState) {
-            color = liveState[h.idx] ? '#00ff88' : '#ff2020';  // green=filled, red=missing
-          } else if (h.occupied !== null && !patternMode) {
+        const hasLive  = (h.idx in liveState);
+        let color, r = isTarget ? 7 : 5;
+        if (hasLive) {
+          // Live detection state — drives colour for ANY hole the detector reports
+          color = liveState[h.idx] ? (inferredSet.has(h.idx) ? '#aaff00' : '#00ff88') : '#ff2020';  // green=measured, chartreuse=inferred, red=missing
+          if (liveState[h.idx]) r = isTarget ? 8 : 6;         // pop filled holes
+        } else if (isTarget) {
+          if (h.occupied !== null && !patternMode) {
             color = h.occupied ? '#00ff88' : '#ff2020';
           } else {
-            color = '#ff44cc';  // magenta = target marker (not yet detected)
+            color = '#00e5ff';  // cyan = template hole waiting for peg
           }
         } else if (patternMode || patternSet.size > 0) {
           // Background node: dimmed
@@ -943,7 +1436,7 @@ PAGE = """
           color = h.occupied === null ? '#ffe000'
                 : h.occupied          ? '#ff2020' : '#00ff88';
         }
-        drawDot(ctx, x, y, color, isTarget ? 7 : 5);
+        drawDot(ctx, x, y, color, r);
       });
 
       // Triangle outlines
@@ -1078,24 +1571,49 @@ def set_grid_from_lines():
         grid_holes = holes_out
     # Auto-save calibration to disk
     try:
-        import json
-        with open("/home/jerica/grid_holes.json", "w") as f:
-            json.dump(holes_out, f)
+        calib = {
+            "holes":        holes_out,
+            "fov_pct":      fov_pct,
+            "output_hfov":  output_hfov,
+            "undistort_on": undistort_on,
+            "focus":        focus_pos,
+        }
+        _atomic_write_json("/home/jerica/grid_holes.json", calib)
     except Exception as e:
         print(f"Warning: could not save grid: {e}")
     return jsonify({"ok": True, "count": len(holes_out), "holes": holes_out})
 
 
+@app.route("/save_calibration", methods=["POST"])
+def save_calibration():
+    """Re-save the currently-loaded grid plus current camera settings (new format)."""
+    global grid_holes
+    with state_lock:
+        holes = list(grid_holes)
+    if not holes:
+        return jsonify({"error": "No grid loaded — calibrate or Load Last first"}), 400
+    calib = {
+        "holes":        holes,
+        "fov_pct":      fov_pct,
+        "output_hfov":  output_hfov,
+        "undistort_on": undistort_on,
+        "focus":        focus_pos,
+    }
+    try:
+        _atomic_write_json("/home/jerica/grid_holes.json", calib)
+    except Exception as e:
+        return jsonify({"error": f"Save failed: {e}"}), 500
+    return jsonify({"ok": True, "count": len(holes), "fov_pct": fov_pct,
+                    "output_hfov": output_hfov, "undistort_on": undistort_on,
+                    "focus": focus_pos})
+
+
 @app.route("/load_saved_grid")
 def load_saved_grid():
-    global grid_holes
     try:
-        import json
         with open("/home/jerica/grid_holes.json", "r") as f:
-            holes = json.load(f)
-        with state_lock:
-            grid_holes = holes
-        return jsonify({"ok": True, "count": len(holes), "holes": holes})
+            data = json.load(f)
+        return jsonify({"ok": True, **_apply_calibration(data)})
     except FileNotFoundError:
         return jsonify({"error": "No saved calibration found"}), 404
     except Exception as e:
@@ -1112,10 +1630,25 @@ def scan_holes():
         return jsonify({"error": "Not calibrated"}), 400
 
     half = 4
+    try:
+        _exp = int(request.args.get("exp", 0))
+    except (TypeError, ValueError):
+        _exp = 0
+    try:
+        _gain = float(request.args.get("gain", 0))
+    except (TypeError, ValueError):
+        _gain = 0.0
 
     # ── Lock AEC so IR toggle doesn't cause re-expose ────
-    camera.set_controls({"AeEnable": False})
-    time.sleep(0.15)   # one frame for lock to take effect
+    if _exp > 0:
+        _ctrls = {"AeEnable": False, "ExposureTime": _exp}
+        if _gain > 0:
+            _ctrls["AnalogueGain"] = _gain
+        camera.set_controls(_ctrls)
+        time.sleep(0.5)    # exposure change needs several frames to settle
+    else:
+        camera.set_controls({"AeEnable": False})
+        time.sleep(0.15)   # one frame for lock to take effect
 
     # ── IR ON frame ──────────────────────────────────────
     if IR_AVAILABLE:
@@ -1156,17 +1689,23 @@ def scan_holes():
             return float(np.mean(0.299*crop[:,:,0] + 0.587*crop[:,:,1]
                                  + 0.114*crop[:,:,2])) if crop.size else 0.0
 
-        diff = lum(img_on[y1:y2, x1:x2]) - lum(img_off[y1:y2, x1:x2])
-        # Front-lit IR: peg reflects IR → high diff = occupied
-        # Empty hole absorbs IR → low diff = unoccupied
+        l_on  = lum(img_on[y1:y2, x1:x2])
+        l_off = lum(img_off[y1:y2, x1:x2])
+        diff  = l_on - l_off
+        # Front-lit IR: peg reflects IR -> high diff = occupied
+        # Empty hole absorbs IR -> low diff = unoccupied
         occupied = diff > thresh
         results.append({"index": i, "pixel_x": px, "pixel_y": py,
-                        "lum": round(diff, 1), "occupied": occupied})
+                        "lum": round(diff, 1), "on": round(l_on, 1),
+                        "off": round(l_off, 1), "occupied": occupied})
 
     avg_diff = round(sum(r["lum"] for r in results) / len(results), 1) if results else 0.0
+    sat = sum(1 for r in results if r["on"] >= 250)
+    max_on = max((r["on"] for r in results), default=0.0)
     with state_lock:
         last_scan_results = list(results)
-    return jsonify({"holes": results, "count": len(results), "avg_diff": avg_diff})
+    return jsonify({"holes": results, "count": len(results), "avg_diff": avg_diff,
+                    "saturated": sat, "max_on": max_on, "exp": _exp, "gain": _gain})
 
 
 def find_triangles_in_grid(holes, results, side_len=2):
@@ -1303,12 +1842,16 @@ def set_led():
     r = max(0, min(255, int(request.args.get("r", 0))))
     g = max(0, min(255, int(request.args.get("g", 0))))
     b = max(0, min(255, int(request.args.get("b", 0))))
+    global led_color
+    led_color = (r, g, b)
     _spi_show(r, g, b)
     return jsonify({"r": r, "g": g, "b": b})
 
 @app.route("/set_focus")
 def set_focus():
+    global focus_pos
     pos = max(0.0, min(30.0, float(request.args.get("pos", 0))))
+    focus_pos = pos
     if pos <= 0:
         camera.set_controls({
             "AfMode":  controls.AfModeEnum.Continuous,
@@ -1330,6 +1873,15 @@ def set_diff_threshold():
         diff_threshold = val
     _save_settings("diff_threshold", val)
     return jsonify({"diff_threshold": val})
+
+@app.route("/set_adapt_margin")
+def set_adapt_margin():
+    global adapt_margin
+    val = max(0, min(150, int(request.args.get("val", 30))))
+    with state_lock:
+        adapt_margin = val
+    _save_settings("adapt_margin", val)
+    return jsonify({"adapt_margin": val})
 
 @app.route("/set_brightness_threshold")
 def set_brightness_threshold():
@@ -1383,7 +1935,24 @@ def clear_pattern():
         target_pattern     = set()
         consecutive_matches = 0
         puzzle_solved       = False
+    _set_current_template(None)
     return jsonify({"ok": True})
+
+@app.route("/set_target_pattern", methods=["POST"])
+def set_target_pattern():
+    """Set the active target pattern from a list of hole indices.
+    Body: {"holes": [3, 7, 12, ...]}"""
+    global target_pattern, consecutive_matches, puzzle_solved
+    data  = request.get_json() or {}
+    holes = data.get("holes", [])
+    name  = (data.get("name") or "").strip() or None
+    with state_lock:
+        target_pattern      = set(int(i) for i in holes)
+        consecutive_matches = 0
+        puzzle_solved       = False
+    _set_current_template(name)
+    return jsonify({"ok": True, "hole_count": len(target_pattern), "template": name})
+
 
 @app.route("/start_detection")
 def start_detection():
@@ -1394,7 +1963,7 @@ def start_detection():
         if not grid_holes:
             return jsonify({"error": "Not calibrated"}), 400
         if not target_pattern:
-            return jsonify({"error": "No pattern set"}), 400
+            return jsonify({"error": "No target pattern — select holes or load a template first"}), 400
         detection_running   = True
         consecutive_matches = 0
         puzzle_solved       = False
@@ -1422,6 +1991,9 @@ def detection_status():
         st    = detection_strict
         diffs = dict(detection_last_diffs)
         thresh = diff_threshold
+        am     = adapt_margin
+        inf    = list(detection_inferred)
+        lt     = last_trigger
     matched = sum(1 for v in live.values() if v)
     # debug: avg/max diff across all computed holes
     diff_vals = list(diffs.values())
@@ -1440,6 +2012,9 @@ def detection_status():
         "avg_diff":            avg_diff,
         "max_diff":            max_diff,
         "threshold":           thresh,
+        "adapt_margin":        am,
+        "inferred":            list(inf),
+        "last_trigger":        lt,
     })
 
 @app.route("/set_detection_strict")
@@ -1482,6 +2057,221 @@ def toggle_filter():
         filter_on = not filter_on
         state = filter_on
     return jsonify({"on": state})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Template management routes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/templates")
+def get_templates():
+    """List all stored templates."""
+    templates = _load_templates()
+    return jsonify([{
+        "name":       t["name"],
+        "hole_count": len(t["holes"]),
+        "created":    t.get("created", ""),
+    } for t in templates])
+
+
+def _scan_ambient():
+    """
+    Take an ambient (IR-off) frame and return per-hole luminance list.
+    Returns (lum_list, error_str). error_str is None on success.
+    """
+    with state_lock:
+        holes = list(grid_holes)
+    if not holes:
+        return None, "Not calibrated"
+    if IR_AVAILABLE:
+        ir_led.off()
+    time.sleep(0.15)
+    with frame_lock:
+        frame = latest_frame
+    if not frame:
+        return None, "No frame"
+    img = np.array(Image.open(io.BytesIO(frame)))
+    lums = [_hole_lum(img, int(round(h["px"])), int(round(h["py"]))) for h in holes]
+    return lums, None
+
+
+def _classify_open_holes(lum_list):
+    """
+    Use Otsu thresholding on hole luminance to find open (dark) holes.
+    Returns (open_hole_indices, threshold_value).
+    Returns ([], 0) if variance is too low (no template present).
+    """
+    arr = np.array(lum_list, dtype=np.float32)
+    if arr.std() < 6.0:
+        return [], 0.0
+    # Normalise to 0-255 for Otsu
+    mn, mx = arr.min(), arr.max()
+    if mx == mn:
+        return [], 0.0
+    u8 = ((arr - mn) / (mx - mn) * 255).astype(np.uint8).reshape(1, -1)
+    otsu_u8, _ = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh = float(otsu_u8) / 255.0 * (mx - mn) + mn
+    open_holes = [i for i, l in enumerate(lum_list) if l < thresh]
+    return open_holes, round(float(thresh), 1)
+
+
+@app.route("/detect_template")
+def detect_template_route():
+    """
+    Scan ambient frame, detect open holes (template cutouts) via Otsu,
+    match against stored templates, auto-load best match as target pattern.
+    """
+    global target_pattern, consecutive_matches, puzzle_solved
+    lums, err = _scan_ambient()
+    if err:
+        return jsonify({"error": err}), (400 if err == "Not calibrated" else 503)
+
+    open_holes, thresh = _classify_open_holes(lums)
+    if not open_holes:
+        return jsonify({
+            "open_holes": [], "hole_count": 0,
+            "match": None, "all_matches": [],
+            "msg": "No template detected — board appears uniform",
+        })
+
+    # Match against stored templates
+    templates = _load_templates()
+    matches = []
+    open_set = set(open_holes)
+    for tmpl in templates:
+        tmpl_set = set(tmpl["holes"])
+        if not tmpl_set and not open_set:
+            score = 1.0
+        elif not tmpl_set or not open_set:
+            score = 0.0
+        else:
+            intersection = len(tmpl_set & open_set)
+            union        = len(tmpl_set | open_set)
+            score = intersection / union if union > 0 else 0.0
+        matches.append({"name": tmpl["name"], "score": round(score, 3)})
+
+    matches.sort(key=lambda x: -x["score"])
+    best_match = matches[0] if matches and matches[0]["score"] >= 0.7 else None
+
+    # Load matched template's holes (or use detected open holes if no match)
+    if best_match:
+        tmpl_holes = next(
+            (t["holes"] for t in templates if t["name"] == best_match["name"]),
+            open_holes,
+        )
+    else:
+        tmpl_holes = open_holes
+
+    with state_lock:
+        target_pattern      = set(tmpl_holes)
+        consecutive_matches = 0
+        puzzle_solved       = False
+    _set_current_template(best_match["name"] if best_match else None)
+
+    return jsonify({
+        "open_holes":  open_holes,
+        "hole_count":  len(open_holes),
+        "match":       best_match,
+        "all_matches": matches,
+        "lum_thresh":  thresh,
+    })
+
+
+@app.route("/save_template", methods=["POST"])
+def save_template():
+    """
+    Save current ambient scan as a named template.
+    Body: {"name": "Butterfly"}
+    """
+    data = request.get_json() or {}
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "Name required"}), 400
+
+    lums, err = _scan_ambient()
+    if err:
+        return jsonify({"error": err}), (400 if err == "Not calibrated" else 503)
+
+    open_holes, thresh = _classify_open_holes(lums)
+    if not open_holes:
+        return jsonify({"error": "No template detected — place template on board first"}), 400
+
+    templates = _load_templates()
+    templates = [t for t in templates if t["name"] != name]  # replace if exists
+    templates.append({
+        "name":    name,
+        "holes":   open_holes,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+    _save_templates_to_disk(templates)
+
+    return jsonify({"ok": True, "name": name, "hole_count": len(open_holes)})
+
+
+@app.route("/save_template_holes", methods=["POST"])
+def save_template_holes():
+    """Save a manually-selected set of hole indices as a named template."""
+    data = request.get_json() or {}
+    name  = data.get("name", "").strip()
+    holes = data.get("holes", [])
+    if not name:
+        return jsonify({"error": "Name required"}), 400
+    if not holes:
+        return jsonify({"error": "No holes provided"}), 400
+    templates = _load_templates()
+    templates = [t for t in templates if t["name"] != name]
+    templates.append({
+        "name":    name,
+        "holes":   [int(i) for i in holes],
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    })
+    _save_templates_to_disk(templates)
+    return jsonify({"ok": True, "name": name, "hole_count": len(holes)})
+
+
+@app.route("/delete_template", methods=["POST"])
+def delete_template():
+    """Delete a named template. Body: {"name": "Butterfly"}"""
+    data = request.get_json() or {}
+    name = data.get("name", "").strip()
+    templates = _load_templates()
+    templates = [t for t in templates if t["name"] != name]
+    _save_templates_to_disk(templates)
+    return jsonify({"ok": True})
+
+
+@app.route("/load_template", methods=["POST"])
+def load_template():
+    """Manually load a template by name. Body: {"name": "Butterfly"}"""
+    global target_pattern, consecutive_matches, puzzle_solved
+    data = request.get_json() or {}
+    name = data.get("name", "").strip()
+    templates = _load_templates()
+    tmpl = next((t for t in templates if t["name"] == name), None)
+    if not tmpl:
+        return jsonify({"error": "Template not found"}), 404
+    with state_lock:
+        target_pattern      = set(tmpl["holes"])
+        consecutive_matches = 0
+        puzzle_solved       = False
+    _set_current_template(name)
+    return jsonify({"ok": True, "name": name, "hole_count": len(tmpl["holes"]),
+                    "holes": list(tmpl["holes"])})
+
+
+@app.route("/test_trigger")
+def test_trigger():
+    """Manually fire the win trigger for wiring tests. /test_trigger?code=S"""
+    code = request.args.get("code", "S")
+    url  = request.args.get("url")  # optional explicit override
+    if not url:
+        for _e in (_load_settings().get("pattern_map") or {}).values():
+            _c, _u = _resolve_pattern_entry(_e)
+            if _c == code and _u:
+                url = _u
+                break
+    _send_win_trigger(code, url)
+    return jsonify({"ok": True, "sent": {"code": code, "url": url}})
 
 
 if __name__ == "__main__":
