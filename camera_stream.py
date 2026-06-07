@@ -191,6 +191,32 @@ DETECT_EXPOSURE_US           = 12000  # microseconds (~1/83s); no clipping, stro
 DETECT_GAIN                  = 1.0    # lowest analogue gain = least sensor noise
 detection_inferred           = []    # idx list: pattern nodes filled by neighbor inference (for UI)
 
+# ── Autonomous sleep/wake state machine ───────────────
+auto_mode            = bool(_settings.get("auto_mode", False))
+auto_state           = "SLEEP"           # SLEEP|IDENTIFY|DETECT|WIN|CLEAR_WAIT|COOLDOWN
+auto_lock            = threading.Lock()  # dedicated; guards auto_* status fields only
+auto_locked_template = None              # template name locked this round (or None)
+auto_last_filled     = 0                 # last filled-hole count seen by the supervisor
+auto_wake_streak     = 0                 # consecutive qualifying SLEEP polls (debounce)
+
+# Hard-coded defaults; live values come from settings.json "auto" block.
+AUTO_DEFAULTS = {
+    "sleep_poll_s": 4.0, "min_wake_pegs": 3, "wake_debounce": 2,
+    "identify_fraction": 0.35, "identify_margin": 0.20, "identify_slack": 1,
+    "identify_timeout_s": 20.0, "inactivity_s": 90.0, "cooldown_s": 5.0,
+    "clear_threshold": 2, "clear_timeout_s": 120.0, "identify_poll_s": 1.0,
+    # Coarse wake/identify scan uses a FIXED exposure (like detection_loop) so the
+    # IR-on frame doesn't clip and read the whole board as filled. Tunable on-site.
+    "scan_exposure_us": DETECT_EXPOSURE_US, "scan_gain": DETECT_GAIN, "scan_threshold": 30,
+    "idle_brightness": 24, "idle_color": "rainbow", "idle_speed": 0.6,
+}
+
+def _auto_cfg():
+    """Live auto-mode config: AUTO_DEFAULTS overlaid with settings.json 'auto'."""
+    cfg = dict(AUTO_DEFAULTS)
+    cfg.update(_load_settings().get("auto") or {})
+    return cfg
+
 def apply_crop(pct):
     w = int(SENSOR_W * pct / 100)
     h = int(SENSOR_H * pct / 100)
@@ -617,6 +643,288 @@ def detection_loop():
         if IR_AVAILABLE: ir_led.off()
         with state_lock:
             detection_running = False
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Autonomous sleep/wake supervisor
+# ════════════════════════════════════════════════════════════════════════
+
+def _real_templates():
+    """Return [(name, set(holes)), ...] for the four play templates (skips
+    'calibration' and any empty/holeless entry)."""
+    out = []
+    for t in _load_templates():
+        name = (t.get("name") or "").strip()
+        if not name or name.lower() == "calibration":
+            continue
+        H = set(int(i) for i in t.get("holes", []))
+        if H:
+            out.append((name, H))
+    return out
+
+
+def _template_holes(name):
+    for n, H in _real_templates():
+        if n == name:
+            return H
+    return set()
+
+
+def _subset_of_any(filled):
+    """True if `filled` is a subset of at least one real template's hole-set."""
+    f = set(filled)
+    return any(f <= H for _, H in _real_templates())
+
+
+def _identify_template(filled):
+    """Pure: given currently-filled hole indices, decide which template (if any)
+    the player is filling. Returns (locked_name|None, scored_list).
+
+    Physical constraint: each overlay exposes ONLY its own pattern holes, so
+    `filled` is expected to be a subset of the active template's hole-set.
+      Rule A: exactly one template is a superset of `filled` -> lock it.
+      Rule B: several supersets -> lock the best by fill fraction only if it
+              clears identify_fraction AND beats the runner-up by identify_margin.
+      Rule C: no exact superset (stray/noise) -> tolerate up to identify_slack
+              extra pegs if the best coverage >= identify_fraction.
+    """
+    cfg      = _auto_cfg()
+    frac_min = float(cfg["identify_fraction"])
+    margin   = float(cfg["identify_margin"])
+    slack    = int(cfg["identify_slack"])
+    filled   = set(filled)
+
+    scored, supersets = [], []
+    for name, H in _real_templates():
+        inter     = len(filled & H)
+        extra     = len(filled - H)
+        fill_frac = inter / len(H)
+        is_sup    = (extra == 0)
+        scored.append({"name": name, "fill_frac": round(fill_frac, 3),
+                       "extra": extra, "inter": inter, "size": len(H),
+                       "superset": is_sup})
+        if is_sup:
+            supersets.append((name, fill_frac))
+    scored.sort(key=lambda s: (-int(s["superset"]), -s["fill_frac"]))
+
+    if not filled:
+        return None, scored
+
+    # Rule A / B — among exact supersets
+    if len(supersets) == 1:
+        return supersets[0][0], scored
+    if len(supersets) >= 2:
+        supersets.sort(key=lambda s: -s[1])
+        best, runner = supersets[0], supersets[1]
+        if best[1] >= frac_min and (best[1] - runner[1]) >= margin:
+            return best[0], scored
+        return None, scored
+
+    # Rule C — no exact superset; tolerate a little noise
+    cands = sorted((s for s in scored if s["extra"] <= slack and s["fill_frac"] >= frac_min),
+                   key=lambda s: -s["fill_frac"])
+    if len(cands) == 1:
+        return cands[0]["name"], scored
+    if len(cands) >= 2 and (cands[0]["fill_frac"] - cands[1]["fill_frac"]) >= margin:
+        return cands[0]["name"], scored
+    return None, scored
+
+
+def _idle_animation_step(phase):
+    """Render ONE cheap, non-blocking frame of a slow, dim idle pattern and
+    return the next phase value. No-op when LEDs are unavailable."""
+    if not LED_AVAILABLE:
+        return phase + 1
+    cfg    = _auto_cfg()
+    bright = max(0, min(255, int(cfg["idle_brightness"])))
+    speed  = float(cfg["idle_speed"])
+    color  = str(cfg["idle_color"]).lower().strip()
+    n      = LED_COUNT - LED_OFFSET
+    if n <= 0:
+        return phase + 1
+
+    pixels = [(0, 0, 0)] * LED_COUNT
+    if color == "rainbow":
+        for i in range(n):
+            r, g, b = _wheel((i * 256 // n + int(phase)) % 256)
+            pixels[i + LED_OFFSET] = (r * bright // 255, g * bright // 255, b * bright // 255)
+    else:
+        # breathing single colour ("#rrggbb" or "r,g,b"; fallback dim white)
+        base = (255, 255, 255)
+        try:
+            if color.startswith("#") and len(color) == 7:
+                base = (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
+            elif "," in color:
+                base = tuple(int(x) for x in color.split(",")[:3])
+        except Exception:
+            base = (255, 255, 255)
+        tri   = int(phase) % 510
+        lvl   = tri if tri < 255 else 510 - tri        # 0..255 triangle wave
+        scale = (lvl * bright) // 255
+        col   = (base[0] * scale // 255, base[1] * scale // 255, base[2] * scale // 255)
+        for i in range(n):
+            pixels[i + LED_OFFSET] = col
+    _spi_show_pixels(pixels)
+    return int(phase + max(1, round(speed * 4)))
+
+
+def _auto_set(**kw):
+    """Update auto_* status fields under auto_lock."""
+    global auto_state, auto_locked_template, auto_last_filled, auto_wake_streak
+    with auto_lock:
+        if "state" in kw:   auto_state           = kw["state"]
+        if "locked" in kw:  auto_locked_template = kw["locked"]
+        if "filled" in kw:  auto_last_filled     = kw["filled"]
+        if "streak" in kw:  auto_wake_streak     = kw["streak"]
+
+
+def auto_loop():
+    """Daemon supervisor for autonomous play. While auto_mode is False it idles
+    cheaply. When enabled it cycles SLEEP -> IDENTIFY -> DETECT -> WIN ->
+    CLEAR_WAIT -> COOLDOWN -> SLEEP, reusing the existing detection_loop and
+    win sequence. IR/camera are only touched in non-DETECT states (DETECT is a
+    read-only monitor), so there is no contention with detection_loop."""
+    global target_pattern, consecutive_matches, puzzle_solved, detection_running
+
+    phase      = 0
+    tick       = 0.1
+    last_scan  = 0.0
+    t_identify = 0.0
+    t_state    = 0.0           # when current state was entered
+    last_sig   = None
+    t_sig      = 0.0
+
+    while True:
+        if not auto_mode:
+            time.sleep(0.2)
+            continue
+        try:
+            cfg   = _auto_cfg()
+            now   = time.time()
+            state = auto_state
+
+            if state == "SLEEP":
+                phase = _idle_animation_step(phase)
+                if now - last_scan >= float(cfg["sleep_poll_s"]):
+                    last_scan = now
+                    _, filled, err = _scan_filled_holes(
+                        thresh=float(cfg["scan_threshold"]),
+                        exp=int(cfg["scan_exposure_us"]),
+                        gain=float(cfg["scan_gain"]))
+                    if not err:
+                        _auto_set(filled=len(filled))
+                        qualifies = (len(filled) >= int(cfg["min_wake_pegs"])
+                                     and _subset_of_any(filled))
+                        streak = (auto_wake_streak + 1) if qualifies else 0
+                        _auto_set(streak=streak)
+                        if streak >= int(cfg["wake_debounce"]):
+                            _auto_set(state="IDENTIFY", streak=0)
+                            t_identify = now
+                            last_scan  = 0.0
+                time.sleep(tick)
+
+            elif state == "IDENTIFY":
+                if now - last_scan >= float(cfg["identify_poll_s"]):
+                    last_scan = now
+                    _, filled, err = _scan_filled_holes(
+                        thresh=float(cfg["scan_threshold"]),
+                        exp=int(cfg["scan_exposure_us"]),
+                        gain=float(cfg["scan_gain"]))
+                    if not err:
+                        _auto_set(filled=len(filled))
+                        if len(filled) < int(cfg["min_wake_pegs"]):
+                            _auto_set(state="SLEEP")
+                        else:
+                            name, _scored = _identify_template(filled)
+                            if name:
+                                H = _template_holes(name)
+                                with state_lock:
+                                    target_pattern      = set(H)
+                                    consecutive_matches = 0
+                                    puzzle_solved       = False
+                                    detection_running   = True
+                                _set_current_template(name)
+                                _auto_set(state="DETECT", locked=name)
+                                last_sig = None
+                                t_sig    = now
+                                threading.Thread(target=detection_loop, daemon=True).start()
+                if auto_state == "IDENTIFY" and now - t_identify >= float(cfg["identify_timeout_s"]):
+                    _auto_set(state="SLEEP")
+                time.sleep(tick)
+
+            elif state == "DETECT":
+                # Read-only monitor: never touch IR/camera/LED here.
+                with state_lock:
+                    ps   = puzzle_solved
+                    dr   = detection_running
+                    live = dict(detection_live_state)
+                if ps:
+                    # Win detected: stop the loop so it can't re-fire, hand to WIN.
+                    with state_lock:
+                        detection_running = False
+                    _auto_set(state="WIN")
+                else:
+                    sig = frozenset(k for k, v in live.items() if v)
+                    if sig != last_sig:
+                        last_sig = sig
+                        t_sig    = now
+                        _auto_set(filled=len(sig))
+                    if not dr:
+                        _auto_set(state="COOLDOWN")
+                        t_state = now
+                    elif now - t_sig >= float(cfg["inactivity_s"]):
+                        with state_lock:
+                            detection_running = False
+                        _auto_set(state="COOLDOWN")
+                        t_state = now
+                time.sleep(tick)
+
+            elif state == "WIN":
+                # _win_then_reset (animation + receiver POST) is running; it flips
+                # puzzle_solved back to False when the animation finishes.
+                with state_lock:
+                    ps = puzzle_solved
+                if not ps:
+                    with state_lock:
+                        detection_running = False
+                    _auto_set(state="CLEAR_WAIT")
+                    t_state = now
+                time.sleep(tick)
+
+            elif state == "CLEAR_WAIT":
+                phase = _idle_animation_step(phase)
+                if now - last_scan >= float(cfg["sleep_poll_s"]):
+                    last_scan = now
+                    _, filled, err = _scan_filled_holes(
+                        thresh=float(cfg["scan_threshold"]),
+                        exp=int(cfg["scan_exposure_us"]),
+                        gain=float(cfg["scan_gain"]))
+                    if not err:
+                        _auto_set(filled=len(filled))
+                        if len(filled) < int(cfg["clear_threshold"]):
+                            _auto_set(state="COOLDOWN")
+                            t_state = now
+                if auto_state == "CLEAR_WAIT" and now - t_state >= float(cfg["clear_timeout_s"]):
+                    _auto_set(state="COOLDOWN")
+                    t_state = now
+                time.sleep(tick)
+
+            elif state == "COOLDOWN":
+                phase = _idle_animation_step(phase)
+                if now - t_state >= float(cfg["cooldown_s"]):
+                    _auto_set(state="SLEEP", locked=None)
+                    last_scan = 0.0
+                time.sleep(tick)
+
+            else:
+                _auto_set(state="SLEEP")
+                time.sleep(tick)
+        except Exception as e:
+            print(f"[auto_loop] error in {auto_state}: {e}")
+            time.sleep(0.5)
+
+
+threading.Thread(target=auto_loop, daemon=True).start()
 
 
 def generate():
@@ -1637,31 +1945,33 @@ def load_saved_grid():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/scan_holes")
-def scan_holes():
-    global last_scan_results
+def _scan_filled_holes(thresh=None, exp=0, gain=0.0):
+    """Single IR-on/IR-off differential scan of every calibrated hole.
+
+    Reusable engine shared by the /scan_holes route and the autonomous
+    supervisor (auto_loop). Snapshots grid/threshold/ir under state_lock,
+    locks AE so the IR toggle doesn't re-expose, grabs an IR-on and IR-off
+    frame, restores prior IR + AE, then computes a center-patch luminance
+    diff per hole.
+
+    Returns (results, filled_set, err) where:
+      results    = list of per-hole dicts (same shape the route returns)
+      filled_set = set of hole indices with occupied==True
+      err        = None on success, or (message, http_status) on failure
+    """
     with state_lock:
         holes     = list(grid_holes)
-        thresh    = diff_threshold
+        thr       = diff_threshold if thresh is None else thresh
         was_ir_on = ir_state
     if not holes:
-        return jsonify({"error": "Not calibrated"}), 400
+        return [], set(), ("Not calibrated", 400)
 
     half = 4
-    try:
-        _exp = int(request.args.get("exp", 0))
-    except (TypeError, ValueError):
-        _exp = 0
-    try:
-        _gain = float(request.args.get("gain", 0))
-    except (TypeError, ValueError):
-        _gain = 0.0
-
     # ── Lock AEC so IR toggle doesn't cause re-expose ────
-    if _exp > 0:
-        _ctrls = {"AeEnable": False, "ExposureTime": _exp}
-        if _gain > 0:
-            _ctrls["AnalogueGain"] = _gain
+    if exp > 0:
+        _ctrls = {"AeEnable": False, "ExposureTime": int(exp)}
+        if gain > 0:
+            _ctrls["AnalogueGain"] = float(gain)
         camera.set_controls(_ctrls)
         time.sleep(0.5)    # exposure change needs several frames to settle
     else:
@@ -1691,31 +2001,53 @@ def scan_holes():
     camera.set_controls({"AeEnable": True})
 
     if not frame_on or not frame_off:
-        return jsonify({"error": "No frame"}), 503
+        return [], set(), ("No frame", 503)
 
     img_on  = np.array(Image.open(io.BytesIO(frame_on)))
     img_off = np.array(Image.open(io.BytesIO(frame_off)))
     h, w    = img_on.shape[:2]
 
+    def lum(crop):
+        return float(np.mean(0.299*crop[:,:,0] + 0.587*crop[:,:,1]
+                             + 0.114*crop[:,:,2])) if crop.size else 0.0
+
     results = []
+    filled  = set()
     for i, hole in enumerate(holes):
         px, py = int(round(hole["px"])), int(round(hole["py"]))
         x1, y1 = max(0, px-half), max(0, py-half)
         x2, y2 = min(w, px+half), min(h, py+half)
-
-        def lum(crop):
-            return float(np.mean(0.299*crop[:,:,0] + 0.587*crop[:,:,1]
-                                 + 0.114*crop[:,:,2])) if crop.size else 0.0
-
         l_on  = lum(img_on[y1:y2, x1:x2])
         l_off = lum(img_off[y1:y2, x1:x2])
         diff  = l_on - l_off
         # Front-lit IR: peg reflects IR -> high diff = occupied
         # Empty hole absorbs IR -> low diff = unoccupied
-        occupied = diff > thresh
+        occupied = diff > thr
+        if occupied:
+            filled.add(i)
         results.append({"index": i, "pixel_x": px, "pixel_y": py,
                         "lum": round(diff, 1), "on": round(l_on, 1),
                         "off": round(l_off, 1), "occupied": occupied})
+    return results, filled, None
+
+
+@app.route("/scan_holes")
+def scan_holes():
+    global last_scan_results
+    if auto_state == "DETECT":
+        return jsonify({"error": "auto detection in progress"}), 409
+    try:
+        _exp = int(request.args.get("exp", 0))
+    except (TypeError, ValueError):
+        _exp = 0
+    try:
+        _gain = float(request.args.get("gain", 0))
+    except (TypeError, ValueError):
+        _gain = 0.0
+
+    results, _filled, err = _scan_filled_holes(exp=_exp, gain=_gain)
+    if err:
+        return jsonify({"error": err[0]}), err[1]
 
     avg_diff = round(sum(r["lum"] for r in results) / len(results), 1) if results else 0.0
     sat = sum(1 for r in results if r["on"] >= 250)
@@ -1975,6 +2307,8 @@ def set_target_pattern():
 @app.route("/start_detection")
 def start_detection():
     global detection_running, consecutive_matches, puzzle_solved
+    if auto_mode:
+        return jsonify({"error": "auto mode active"}), 409
     with state_lock:
         if detection_running:
             return jsonify({"ok": True, "already_running": True})
@@ -2033,6 +2367,11 @@ def detection_status():
         "adapt_margin":        am,
         "inferred":            list(inf),
         "last_trigger":        lt,
+        "auto_mode":           auto_mode,
+        "auto_state":          auto_state,
+        "auto_locked":         auto_locked_template,
+        "auto_filled":         auto_last_filled,
+        "auto_wake_streak":    auto_wake_streak,
     })
 
 @app.route("/set_detection_strict")
@@ -2042,6 +2381,41 @@ def set_detection_strict():
     with state_lock:
         detection_strict = val
     return jsonify({"strict": val})
+
+@app.route("/set_auto")
+def set_auto():
+    """Enable/disable autonomous sleep/wake mode. /set_auto?on=1|0"""
+    global auto_mode, detection_running
+    on = request.args.get("on", "0") == "1"
+    if on:
+        # Validate prerequisites before arming.
+        with state_lock:
+            calibrated = bool(grid_holes)
+            manual_running = detection_running
+        if not calibrated:
+            return jsonify({"error": "Not calibrated — calibrate or Load Last first"}), 400
+        if manual_running:
+            return jsonify({"error": "Manual detection running — stop it first"}), 409
+        names = {n for n, _ in _real_templates()}
+        missing = [t for t in ("S", "D", "O", "C") if t not in names]
+        if missing:
+            return jsonify({"error": f"Missing templates: {','.join(missing)}",
+                            "have": sorted(names)}), 400
+        auto_mode = True
+        _save_settings("auto_mode", True)
+        _auto_set(state="SLEEP", locked=None, filled=0, streak=0)
+    else:
+        auto_mode = False
+        _save_settings("auto_mode", False)
+        with state_lock:
+            detection_running = False
+        if IR_AVAILABLE:
+            ir_led.off()
+        camera.set_controls({"AeEnable": True})
+        if LED_AVAILABLE:
+            _spi_show(*led_color)
+        _auto_set(state="SLEEP", locked=None)
+    return jsonify({"auto_mode": auto_mode, "auto_state": auto_state})
 
 @app.route("/reset_puzzle")
 def reset_puzzle():
@@ -2140,6 +2514,8 @@ def detect_template_route():
     match against stored templates, auto-load best match as target pattern.
     """
     global target_pattern, consecutive_matches, puzzle_solved
+    if auto_state == "DETECT":
+        return jsonify({"error": "auto detection in progress"}), 409
     lums, err = _scan_ambient()
     if err:
         return jsonify({"error": err}), (400 if err == "Not calibrated" else 503)
@@ -2201,6 +2577,8 @@ def save_template():
     Save current ambient scan as a named template.
     Body: {"name": "Butterfly"}
     """
+    if auto_state == "DETECT":
+        return jsonify({"error": "auto detection in progress"}), 409
     data = request.get_json() or {}
     name = data.get("name", "").strip()
     if not name:
