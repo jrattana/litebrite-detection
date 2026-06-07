@@ -1,1 +1,28 @@
-{"adapt_margin": 35}
+{
+  "adapt_margin": 35,
+  "win_trigger": {
+    "enabled": true,
+    "base_url": "http://192.168.4.38:42425",
+    "timeout_s": 2.0,
+    "retries": 1,
+    "field_code": "code"
+  },
+  "pattern_map": {
+    "S": {
+      "code": "S",
+      "path": "/sigil/sacred"
+    },
+    "D": {
+      "code": "D",
+      "path": "/sigil/directive"
+    },
+    "O": {
+      "code": "O",
+      "path": "/sigil/oracle"
+    },
+    "C": {
+      "code": "C",
+      "path": "/sigil/chaos"
+    }
+  }
+}

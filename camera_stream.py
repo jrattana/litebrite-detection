@@ -19,7 +19,7 @@ from undistort import Undistorter
 #   0-bit: 1 0 0  → T0H=417ns, T0L=833ns
 # 8 WS bits packed into 3 SPI bytes → 9 SPI bytes per 24-bit pixel
 LED_OFFSET = 0   # new WS2815 strip: drive from the first LED
-LED_COUNT  = 460
+LED_COUNT  = 30   # WS2811 diffuse strip (~44 in); 30 addressable pixels, measured via /count_ruler
 led_color  = (0, 0, 0)   # last colour set via /set_led; restored after the win sequence
 
 def _encode_color_byte(v):
@@ -318,41 +318,24 @@ def _win_animation():
 
     n = LED_COUNT - LED_OFFSET   # number of active LEDs
 
-    # 1. Rapid white strobe
-    for _ in range(8):
-        _spi_show(255, 255, 255)
-        time.sleep(0.04)
-        _spi_show(0, 0, 0)
-        time.sleep(0.04)
-
-    # 2. Rainbow wipe — LEDs light up one-by-one along the strip
+    # 1. Rainbow wipe — LEDs light up one-by-one along the strip
     pixels = [(0, 0, 0)] * LED_COUNT
     for i in range(n):
         pixels[i + LED_OFFSET] = _wheel(i * 256 // n)
         _spi_show_pixels(pixels)
-        time.sleep(0.02)
-    time.sleep(0.2)
+        time.sleep(0.04)
+    time.sleep(0.4)
 
-    # 3. Colour chase — whole strip cycles through rainbow together
-    for frame in range(60):
+    # 2. Colour chase — whole strip cycles through rainbow together
+    for frame in range(120):
         pixels = [(0, 0, 0)] * LED_COUNT
         for i in range(n):
             pixels[i + LED_OFFSET] = _wheel((i * 256 // n + frame * 4) % 256)
         _spi_show_pixels(pixels)
         time.sleep(0.04)
 
-    # 4. Sparkle — random LEDs pop white
-    import random
-    for _ in range(40):
-        pixels = [(0, 0, 0)] * LED_COUNT
-        for _ in range(6):
-            idx = random.randint(LED_OFFSET, LED_COUNT - 1)
-            pixels[idx] = (255, 255, 255)
-        _spi_show_pixels(pixels)
-        time.sleep(0.05)
-
-    # 5. Breathe green — three slow pulses then off
-    for _ in range(3):
+    # 3. Breathe green — six slow pulses then off
+    for _ in range(6):
         for v in list(range(0, 256, 6)) + list(range(255, -1, -6)):
             _spi_show(0, v, 0)
             time.sleep(0.008)
@@ -368,12 +351,22 @@ def _set_current_template(name):
         current_template = name
 
 
-def _send_win_trigger(code, url=None):
+def _send_win_trigger(code, url=None, path=None):
     """POST a single-letter win code to the external receiver. Non-blocking; never raises.
-    `url` overrides the global win_trigger.url (per-template routing); falls back to it."""
+
+    URL resolution (first match wins):
+      1. explicit `url`            — full URL override (used by /test_trigger)
+      2. win_trigger.base_url + `path` — on-site you set base_url once; each
+                                         template supplies its own path.
+      3. win_trigger.url           — legacy single fixed URL fallback."""
     global last_trigger
     cfg = (_load_settings().get("win_trigger") or {})
-    url = url or cfg.get("url")
+    if not url:
+        base = (cfg.get("base_url") or "").rstrip("/")
+        if path and base:
+            url = base + "/" + str(path).lstrip("/")
+        else:
+            url = cfg.get("url")
     if not cfg.get("enabled", False) or not url:
         last_trigger = {"time": time.strftime("%H:%M:%S"), "code": code,
                         "ok": False, "err": "disabled or no url"}
@@ -409,10 +402,12 @@ def _send_win_trigger(code, url=None):
 
 
 def _resolve_pattern_entry(entry):
-    """A pattern_map value is either a code string or a {code, url} dict. -> (code, url|None)."""
+    """A pattern_map value is either a bare code string or a {code, path, url} dict.
+    -> (code, url|None, path|None). `path` joins onto win_trigger.base_url;
+    `url` is a full-URL override."""
     if isinstance(entry, dict):
-        return entry.get("code"), entry.get("url")
-    return entry, None
+        return entry.get("code"), entry.get("url"), entry.get("path")
+    return entry, None, None
 
 
 def _fire_win_trigger_for_current():
@@ -420,17 +415,17 @@ def _fire_win_trigger_for_current():
     with state_lock:
         tmpl = current_template
     entry = (_load_settings().get("pattern_map") or {}).get(tmpl)
-    code, url = _resolve_pattern_entry(entry)
+    code, url, path = _resolve_pattern_entry(entry)
     if code:
-        _send_win_trigger(code, url)
+        _send_win_trigger(code, url, path)
     else:
         print(f"[win_trigger] win but no pattern_map entry for template={tmpl!r}; skipped")
 
 
 def _win_then_reset():
-    """Run win animation then auto-reset for next participant."""
-    _fire_win_trigger_for_current()
+    """Play the win animation, THEN fire the trigger, then auto-reset for next participant."""
     _win_animation()
+    _fire_win_trigger_for_current()
     global consecutive_matches, puzzle_solved
     with state_lock:
         consecutive_matches = 0
@@ -671,10 +666,6 @@ PAGE = """
   <div class="sep"></div>
   <button id="undistBtn" onclick="toggleUndist()"
           style="background:#363;color:#afa">🔭 Undistort: ON</button>
-  <label>Output FOV
-    <input type="range" id="ofov" min="20" max="100" value="60"
-           oninput="setOutputFov(this.value)"> <span id="ofovVal">60°</span>
-  </label>
   <div class="sep"></div>
   <label>Focus
     <input type="range" id="focusSlider" min="0" max="30" step="0.1" value="0"
@@ -777,10 +768,6 @@ PAGE = """
     const f = parseFloat(v);
     document.getElementById('focusVal').textContent = f === 0 ? 'auto' : f.toFixed(1) + ' D';
     fetch('/set_focus?pos=' + f);
-  }
-  function setOutputFov(v) {
-    document.getElementById('ofovVal').textContent = v + '°';
-    fetch('/set_output_fov?deg=' + v);
   }
   function onThreshChange(v) {
     document.getElementById('threshVal').textContent = v;
@@ -1019,10 +1006,6 @@ PAGE = """
       if (d.fov_pct !== undefined) {
         document.getElementById('fov').value = d.fov_pct;
         document.getElementById('fovVal').textContent = d.fov_pct + '%';
-      }
-      if (d.output_hfov !== undefined) {
-        document.getElementById('ofov').value = d.output_hfov;
-        document.getElementById('ofovVal').textContent = Math.round(d.output_hfov) + '°';
       }
       if (d.undistort_on !== undefined) {
         const ub = document.getElementById('undistBtn');
@@ -1498,20 +1481,6 @@ def toggle_undistort():
     with state_lock:
         undistort_on = not undistort_on
     return jsonify({"on": undistort_on})
-
-@app.route("/set_output_fov")
-def set_output_fov():
-    global output_hfov, undistorter
-    deg = max(10, min(120, float(request.args.get("deg", 60))))
-    output_hfov = deg
-    new_und = Undistorter(width=IMG_W, height=IMG_H,
-                          input_hfov_deg=INPUT_HFOV,
-                          output_hfov_deg=deg)
-    with state_lock:
-        undistorter = new_und
-    return jsonify({"output_hfov": deg})
-
-
 
 @app.route("/set_grid_from_lines", methods=["POST"])
 def set_grid_from_lines():
@@ -2268,15 +2237,46 @@ def load_template():
 def test_trigger():
     """Manually fire the win trigger for wiring tests. /test_trigger?code=S"""
     code = request.args.get("code", "S")
-    url  = request.args.get("url")  # optional explicit override
+    url  = request.args.get("url")   # optional full-URL override
+    path = None
     if not url:
         for _e in (_load_settings().get("pattern_map") or {}).values():
-            _c, _u = _resolve_pattern_entry(_e)
-            if _c == code and _u:
-                url = _u
+            _c, _u, _p = _resolve_pattern_entry(_e)
+            if _c == code and (_u or _p):
+                url, path = _u, _p
                 break
-    _send_win_trigger(code, url)
-    return jsonify({"ok": True, "sent": {"code": code, "url": url}})
+    _send_win_trigger(code, url, path)
+    return jsonify({"ok": True, "sent": {"code": code, "url": url, "path": path}})
+
+
+@app.route("/test_win_animation")
+def test_win_animation():
+    """Run just the LED win animation (no trigger POST, no puzzle reset) for testing."""
+    if not LED_AVAILABLE:
+        return jsonify({"error": "LED not available"}), 503
+    threading.Thread(target=_win_animation, daemon=True).start()
+    return jsonify({"ok": True, "running": "win_animation"})
+
+
+@app.route("/count_ruler")
+def count_ruler():
+    """Light the strip in coloured bands to gauge/recount its addressable length.
+    /count_ruler?band=25  → each colour spans <band> pixels, in order:
+    red, orange, yellow, green, cyan, blue, purple, magenta, white, dim-red."""
+    if not LED_AVAILABLE:
+        return jsonify({"error": "LED not available"}), 503
+    band = max(1, int(request.args.get("band", 25)))
+    names  = ["red", "orange", "yellow", "green", "cyan", "blue",
+              "purple", "magenta", "white", "dim-red"]
+    colors = [(255, 0, 0), (255, 80, 0), (255, 255, 0), (0, 255, 0), (0, 255, 255),
+              (0, 0, 255), (160, 0, 255), (255, 0, 255), (255, 255, 255), (60, 0, 0)]
+    pixels = [(0, 0, 0)] * LED_COUNT
+    for i in range(LED_COUNT):
+        bi = i // band
+        if bi < len(colors):
+            pixels[i] = colors[bi]
+    _spi_show_pixels(pixels)
+    return jsonify({"ok": True, "band": band, "order": names})
 
 
 if __name__ == "__main__":
