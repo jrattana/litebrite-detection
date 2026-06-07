@@ -36,25 +36,30 @@ def _encode_pixel(r, g, b):
     """Return 9 SPI bytes for one GRB WS2815 pixel."""
     return _encode_color_byte(g) + _encode_color_byte(r) + _encode_color_byte(b)
 
+# LED strip driver — Pi 5 RP1 PIO (hardware-timed WS281x), NOT SPI.
+# Data on board.D13 (GPIO13 / physical pin 33). Byte order is RGB.
+# The function names below keep the historical _spi_* prefix so the rest of
+# the app (/set_led, _win_animation) is untouched, but there is no SPI here.
 try:
-    import spidev as _spidev
-    _spi = _spidev.SpiDev()
-    _spi.open(0, 0)
-    _spi.max_speed_hz = 1200000
-    _spi.mode = 0
+    import board
+    from adafruit_raspberry_pi5_neopixel_write import neopixel_write
+    _LED_PIN = board.D13
     LED_AVAILABLE = True
-    def _spi_show(r, g, b):
-        buf = []
-        for i in range(LED_COUNT):
-            if i < LED_OFFSET:
-                buf += _encode_pixel(0, 0, 0)
-            else:
-                buf += _encode_pixel(r, g, b)
-        buf += [0x00] * 160   # reset: >280µs low (160 × ~2.67µs = 427µs @3MHz)
+
+    def _led_write(buf):
         try:
-            _spi.xfer2(buf)
+            neopixel_write(_LED_PIN, buf)
         except Exception as e:
-            print(f"LED xfer2 failed: {e}")
+            print(f"LED write failed: {e}")
+
+    def _spi_show(r, g, b):
+        # Solid fill, RGB order; the first LED_OFFSET pixels are forced off.
+        px = bytearray(LED_COUNT * 3)
+        for i in range(LED_OFFSET, LED_COUNT):
+            o = i * 3
+            px[o] = r; px[o + 1] = g; px[o + 2] = b
+        _led_write(bytes(px))
+
     _spi_show(0, 0, 0)   # clear on startup
 except Exception as e:
     print(f"LED init failed: {e}")
@@ -294,17 +299,17 @@ def _wheel(pos):
     return (pos * 3, 0, 255 - pos * 3)
 
 def _spi_show_pixels(pixels):
-    """Send an arbitrary per-LED colour list (length LED_COUNT, (r,g,b) tuples)."""
+    """Send an arbitrary per-LED colour list (length LED_COUNT, (r,g,b) tuples).
+    RGB byte order via the PIO driver; first LED_OFFSET pixels forced off."""
     if not LED_AVAILABLE:
         return
-    buf = []
+    px = bytearray(LED_COUNT * 3)
     for i, (r, g, b) in enumerate(pixels):
         if i < LED_OFFSET:
-            buf += _encode_pixel(0, 0, 0)
-        else:
-            buf += _encode_pixel(r, g, b)
-    buf += [0x00] * 100
-    _spi.xfer2(buf)
+            continue
+        o = i * 3
+        px[o] = r; px[o + 1] = g; px[o + 2] = b
+    _led_write(bytes(px))
 
 def _win_animation():
     """Celebration sequence: strobe → rainbow wipe → colour chase → breathe green."""
