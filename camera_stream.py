@@ -684,6 +684,15 @@ PAGE = """
   <div class="sep"></div>
   <button id="btnCalib" onclick="startCalib()" style="background:#444;color:#fff">📐 Calibrate</button>
   <button onclick="loadSavedGrid()" style="background:#444;color:#fff">📂 Load Last</button>
+  <span id="nudgeWrap" style="display:none;align-items:center;gap:2px">
+    <button onclick="nudgeGrid(0,-1)" style="background:#444;color:#fff" title="Nudge up">↑</button>
+    <button onclick="nudgeGrid(0,1)" style="background:#444;color:#fff" title="Nudge down">↓</button>
+    <button onclick="nudgeGrid(-1,0)" style="background:#444;color:#fff" title="Nudge left">←</button>
+    <button onclick="nudgeGrid(1,0)" style="background:#444;color:#fff" title="Nudge right">→</button>
+    <select id="nudgeStep" style="background:#333;color:#fff;border:1px solid #555">
+      <option value="1">1px</option><option value="5" selected>5px</option><option value="10">10px</option>
+    </select>
+  </span>
   <button id="btnSaveCalib" onclick="saveCalibration()" style="background:#444;color:#fff;display:none">💾 Save Calibration</button>
   <button id="btnDone" onclick="phaseDone()" style="display:none;background:#363;color:#afa">✓ Done</button>
   <span id="calibStatus" style="font-size:12px;color:#fa0;"></span>
@@ -1019,6 +1028,7 @@ PAGE = """
           d.focus === 0 ? 'auto' : d.focus.toFixed(1) + ' D';
       }
       document.getElementById('btnSaveCalib').style.display = '';
+      document.getElementById('nudgeWrap').style.display = 'inline-flex';
       setStatus('✓ ' + d.count + ' holes loaded — click 🔍 Detect Template');
       document.getElementById('btnScan').style.display         = 'none';
       document.getElementById('btnDetectTmpl').style.display   = '';
@@ -1038,6 +1048,17 @@ PAGE = """
       setStatus('💾 Saved ' + d.count + ' holes  ·  FOV ' + d.fov_pct + '%  ·  focus ' + f +
                 '  ·  undistort ' + (d.undistort_on ? 'ON' : 'OFF'));
     }).catch(() => { setStatus('✗ Save failed'); });
+  }
+
+  function nudgeGrid(ddx, ddy) {
+    const step = parseInt(document.getElementById('nudgeStep').value || '5', 10);
+    fetch('/nudge_grid?dx=' + (ddx*step) + '&dy=' + (ddy*step))
+      .then(r => r.json()).then(d => {
+        if (d.error) { setStatus('✗ ' + d.error); return; }
+        holeState = d.holes.map((h, i) => ({ px: h.px, py: h.py, occupied: null, idx: i }));
+        setStatus('↕ nudged — ' + d.count + ' holes (💾 Save Calibration to keep)');
+        redrawOverlay();
+      }).catch(() => setStatus('✗ Nudge failed'));
   }
 
   function onDiffChange(v) {
@@ -1556,6 +1577,29 @@ def set_grid_from_lines():
     except Exception as e:
         print(f"Warning: could not save grid: {e}")
     return jsonify({"ok": True, "count": len(holes_out), "holes": holes_out})
+
+
+@app.route("/nudge_grid")
+def nudge_grid():
+    """Translate the currently-loaded grid by (dx,dy) px. Pure translation preserves
+    the hole count and ordering, so saved templates (positional indices) stay valid.
+    In-memory only — operator clicks Save Calibration to persist."""
+    global grid_holes
+    try:
+        dx = int(request.args.get("dx", "0"))
+        dy = int(request.args.get("dy", "0"))
+    except ValueError:
+        return jsonify({"error": "dx/dy must be integers"}), 400
+    with state_lock:
+        if not grid_holes:
+            return jsonify({"error": "No grid loaded — Load Last or Calibrate first"}), 400
+        # Pure translation, NO clamping: clamping would pile edge holes into a
+        # straight line at the boundary. Holes pushed off-screen keep their true
+        # offset (so they return correctly when nudged back); count + ordering
+        # are preserved either way, keeping saved template indices valid.
+        moved = [{"px": int(h["px"]) + dx, "py": int(h["py"]) + dy} for h in grid_holes]
+        grid_holes = moved
+    return jsonify({"ok": True, "count": len(moved), "holes": moved})
 
 
 @app.route("/save_calibration", methods=["POST"])
