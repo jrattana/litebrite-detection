@@ -1,5 +1,6 @@
 {
   "adapt_margin": 35,
+  "win_fraction": 0.85,
   "auto_mode": false,
   "auto": {
     "sleep_poll_s": 4.0,
@@ -20,6 +21,27 @@
     "idle_brightness": 24,
     "idle_color": "rainbow",
     "idle_speed": 0.6
+  },
+  "light": {
+    "mode": "auto",
+    "ambient_split": 90.0,
+    "ambient_hysteresis": 15.0,
+    "day_start": "07:00",
+    "night_start": "19:00",
+    "profiles": {
+      "day": {
+        "exposure_us": 4000,
+        "gain": 1.0,
+        "scan_threshold": 30,
+        "adapt_margin": 35
+      },
+      "night": {
+        "exposure_us": 12000,
+        "gain": 1.0,
+        "scan_threshold": 30,
+        "adapt_margin": 35
+      }
+    }
   },
   "win_trigger": {
     "enabled": true,

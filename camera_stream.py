@@ -174,6 +174,11 @@ detection_strict             = False   # True = background nodes must also be em
 detection_live_state         = {}      # idx -> bool (last frame's per-hole result)
 detection_last_diffs         = {}      # idx -> float (last frame's raw diffs, for debug)
 REQUIRED_CONSECUTIVE_MATCHES = 10
+# Fraction of a template's pattern holes that must read filled to count as a win.
+# 1.0 = every hole (original behaviour). Lowered to tolerate dim edge pegs that
+# the adaptive threshold rejects (IR illumination falls off toward board edges).
+# Live-tunable via /set_win_fraction and settings.json "win_fraction".
+win_fraction                 = float(_settings.get("win_fraction", 1.0))
 NODE_DEBOUNCE_FRAMES         = 2     # consecutive confirming frames required to flip a node
 HYST_FRACTION                = 0.15  # hysteresis half-gap as a fraction of diff_threshold
 HYST_MIN_MARGIN              = 6     # floor for the half-gap, in luminance counts
@@ -189,6 +194,33 @@ NEIGHBOR_MIN_FILLED          = 2     # ...and at least this many (so edge holes 
 # lower exposure keeps headroom so peg-vs-empty contrast survives everywhere.
 DETECT_EXPOSURE_US           = 12000  # microseconds (~1/83s); no clipping, strong IR signal
 DETECT_GAIN                  = 1.0    # lowest analogue gain = least sensor noise
+
+# ── Day/night light handling ──────────────────────────
+# Detection is differential (IR-on minus IR-off), so a steady ambient IR floor
+# largely cancels. The real daytime failure mode is sensor SATURATION: bright
+# sun pushes pixels near 255 so the IR LED can't add signal and the diff
+# collapses. The fix is a shorter daytime EXPOSURE, not a different threshold.
+# A day/night profile carries {exposure_us, gain, scan_threshold, adapt_margin}.
+# The active profile is chosen by the measured ambient (IR-off frame brightness),
+# normalized to a reference exposure so the two profiles' readings are comparable.
+active_detect_exposure_us    = DETECT_EXPOSURE_US  # what detection_loop actually uses
+active_detect_gain           = DETECT_GAIN
+auto_ambient                 = 0.0    # last exposure-normalized IR-off ambient reading
+auto_light_profile           = "night"  # currently selected profile (hysteresis state)
+LIGHT_REF_EXPOSURE_US        = DETECT_EXPOSURE_US  # ambient readings normalized to this
+LIGHT_DEFAULTS = {
+    "mode": "auto",            # auto | day | night | clock | clock_fallback
+    "ambient_split": 90.0,     # normalized IR-off mean above this ⇒ day
+    "ambient_hysteresis": 15.0,  # dead-band so it doesn't flap at dusk
+    "day_start": "07:00",      # only used by clock / clock_fallback
+    "night_start": "19:00",
+    "profiles": {
+        # NOTE: day exposure is a SAFE ESTIMATE — tune in real daylight by
+        # watching /scan_holes saturated/max_on until filled pegs sit < 250.
+        "day":   {"exposure_us": 4000,  "gain": 1.0, "scan_threshold": 30, "adapt_margin": 35},
+        "night": {"exposure_us": 12000, "gain": 1.0, "scan_threshold": 30, "adapt_margin": 35},
+    },
+}
 detection_inferred           = []    # idx list: pattern nodes filled by neighbor inference (for UI)
 
 # ── Autonomous sleep/wake state machine ───────────────
@@ -198,6 +230,9 @@ auto_lock            = threading.Lock()  # dedicated; guards auto_* status field
 auto_locked_template = None              # template name locked this round (or None)
 auto_last_filled     = 0                 # last filled-hole count seen by the supervisor
 auto_wake_streak     = 0                 # consecutive qualifying SLEEP polls (debounce)
+auto_armed           = True              # latch: must see board cleared after a win before
+                                         # it can wake/fire again (stops a left-in completed
+                                         # board from re-triggering the win every clear_timeout)
 
 # Hard-coded defaults; live values come from settings.json "auto" block.
 AUTO_DEFAULTS = {
@@ -216,6 +251,70 @@ def _auto_cfg():
     cfg = dict(AUTO_DEFAULTS)
     cfg.update(_load_settings().get("auto") or {})
     return cfg
+
+def _light_cfg():
+    """Live day/night config: LIGHT_DEFAULTS deep-merged with settings.json 'light'."""
+    cfg = {k: v for k, v in LIGHT_DEFAULTS.items() if k != "profiles"}
+    cfg["profiles"] = {k: dict(v) for k, v in LIGHT_DEFAULTS["profiles"].items()}
+    user = _load_settings().get("light") or {}
+    for k, v in user.items():
+        if k == "profiles" and isinstance(v, dict):
+            for pk, pv in v.items():
+                cfg["profiles"].setdefault(pk, {}).update(pv or {})
+        else:
+            cfg[k] = v
+    return cfg
+
+def _in_day_window(lc):
+    """True if the wall clock is inside [day_start, night_start) (wraps midnight)."""
+    def _parse(s):
+        try:
+            hh, mm = str(s).split(":")
+            return int(hh) * 60 + int(mm)
+        except Exception:
+            return None
+    nowt = time.localtime()
+    nowm = nowt.tm_hour * 60 + nowt.tm_min
+    ds = _parse(lc.get("day_start", "07:00"))
+    ns = _parse(lc.get("night_start", "19:00"))
+    if ds is None or ns is None:
+        return True
+    if ds <= ns:
+        return ds <= nowm < ns
+    return nowm >= ds or nowm < ns   # window wraps past midnight
+
+def _resolve_light():
+    """Pick the active day/night profile. In 'auto' mode the choice tracks the
+    last measured ambient (auto_ambient) with hysteresis so it can't flap at
+    dusk. Returns (name, profile_dict) and updates auto_light_profile."""
+    global auto_light_profile
+    lc    = _light_cfg()
+    mode  = lc.get("mode", "auto")
+    profs = lc.get("profiles", {})
+    night = profs.get("night", LIGHT_DEFAULTS["profiles"]["night"])
+    day   = profs.get("day",   LIGHT_DEFAULTS["profiles"]["day"])
+    cur   = auto_light_profile
+
+    if mode == "day":
+        name = "day"
+    elif mode == "night":
+        name = "night"
+    elif mode == "clock":
+        name = "day" if _in_day_window(lc) else "night"
+    else:  # "auto" or "clock_fallback": drive off measured ambient
+        split = float(lc.get("ambient_split", 90.0))
+        hyst  = float(lc.get("ambient_hysteresis", 15.0))
+        amb   = auto_ambient
+        if amb <= 0 and mode == "clock_fallback":
+            name = "day" if _in_day_window(lc) else "night"   # no reading yet
+        elif cur == "night" and amb > split + hyst:
+            name = "day"
+        elif cur == "day" and amb < split - hyst:
+            name = "night"
+        else:
+            name = cur
+    auto_light_profile = name
+    return name, (night if name == "night" else day)
 
 def apply_crop(pct):
     w = int(SENSOR_W * pct / 100)
@@ -477,10 +576,12 @@ def detection_loop():
             detection_running = False
         return
 
-    # Lock AE + fix exposure low enough to avoid sensor clipping (see DETECT_EXPOSURE_US).
+    # Lock AE + fix exposure low enough to avoid sensor clipping. In auto mode the
+    # supervisor sets active_detect_* from the resolved day/night profile before
+    # spawning this loop; manual detection uses the night defaults.
     camera.set_controls({"AeEnable": False,
-                         "ExposureTime": DETECT_EXPOSURE_US,
-                         "AnalogueGain": DETECT_GAIN})
+                         "ExposureTime": int(active_detect_exposure_us),
+                         "AnalogueGain": float(active_detect_gain)})
     time.sleep(0.5)   # exposure change needs several frames to settle
 
     # Persistent per-node state for hysteresis + temporal debounce
@@ -611,7 +712,12 @@ def detection_loop():
                     inferred.add(i)
 
             live     = {i: (measured[i] or (i in inferred)) for i in pattern}
-            is_match = len(pattern) > 0 and all(live.values())
+            # Win when at least `win_fraction` of the pattern reads filled (1.0 = all).
+            # Tolerates dim edge pegs the adaptive threshold rejects.
+            _wf       = win_fraction
+            _filled_n = sum(1 for v in live.values() if v)
+            _need_n   = max(1, int(np.ceil(len(pattern) * _wf)))
+            is_match  = len(pattern) > 0 and _filled_n >= _need_n
 
             # Background nodes must be EMPTY (debounced) — only in strict mode
             if strict:
@@ -770,12 +876,13 @@ def _idle_animation_step(phase):
 
 def _auto_set(**kw):
     """Update auto_* status fields under auto_lock."""
-    global auto_state, auto_locked_template, auto_last_filled, auto_wake_streak
+    global auto_state, auto_locked_template, auto_last_filled, auto_wake_streak, auto_armed
     with auto_lock:
         if "state" in kw:   auto_state           = kw["state"]
         if "locked" in kw:  auto_locked_template = kw["locked"]
         if "filled" in kw:  auto_last_filled     = kw["filled"]
         if "streak" in kw:  auto_wake_streak     = kw["streak"]
+        if "armed" in kw:   auto_armed           = kw["armed"]
 
 
 def auto_loop():
@@ -785,6 +892,7 @@ def auto_loop():
     win sequence. IR/camera are only touched in non-DETECT states (DETECT is a
     read-only monitor), so there is no contention with detection_loop."""
     global target_pattern, consecutive_matches, puzzle_solved, detection_running
+    global active_detect_exposure_us, active_detect_gain, adapt_margin
 
     phase      = 0
     tick       = 0.1
@@ -803,17 +911,27 @@ def auto_loop():
             now   = time.time()
             state = auto_state
 
+            # Resolve the day/night profile from measured ambient (live-tunable).
+            _lname, _lprof = _resolve_light()
+            scan_exp = int(_lprof.get("exposure_us", cfg["scan_exposure_us"]))
+            scan_gn  = float(_lprof.get("gain", cfg["scan_gain"]))
+            scan_thr = float(_lprof.get("scan_threshold", cfg["scan_threshold"]))
+
             if state == "SLEEP":
                 phase = _idle_animation_step(phase)
                 if now - last_scan >= float(cfg["sleep_poll_s"]):
                     last_scan = now
                     _, filled, err = _scan_filled_holes(
-                        thresh=float(cfg["scan_threshold"]),
-                        exp=int(cfg["scan_exposure_us"]),
-                        gain=float(cfg["scan_gain"]))
+                        thresh=scan_thr, exp=scan_exp, gain=scan_gn)
                     if not err:
                         _auto_set(filled=len(filled))
-                        qualifies = (len(filled) >= int(cfg["min_wake_pegs"])
+                        # Latch re-arm: a board left full after a win lands here
+                        # un-armed; only once we actually see it cleared do we
+                        # allow waking/firing again.
+                        if not auto_armed and len(filled) < int(cfg["clear_threshold"]):
+                            _auto_set(armed=True)
+                        qualifies = (auto_armed
+                                     and len(filled) >= int(cfg["min_wake_pegs"])
                                      and _subset_of_any(filled))
                         streak = (auto_wake_streak + 1) if qualifies else 0
                         _auto_set(streak=streak)
@@ -827,9 +945,7 @@ def auto_loop():
                 if now - last_scan >= float(cfg["identify_poll_s"]):
                     last_scan = now
                     _, filled, err = _scan_filled_holes(
-                        thresh=float(cfg["scan_threshold"]),
-                        exp=int(cfg["scan_exposure_us"]),
-                        gain=float(cfg["scan_gain"]))
+                        thresh=scan_thr, exp=scan_exp, gain=scan_gn)
                     if not err:
                         _auto_set(filled=len(filled))
                         if len(filled) < int(cfg["min_wake_pegs"]):
@@ -844,6 +960,18 @@ def auto_loop():
                                     puzzle_solved       = False
                                     detection_running   = True
                                 _set_current_template(name)
+                                # Hand the resolved day/night profile to the
+                                # detector (exposure/gain + adaptive margin).
+                                active_detect_exposure_us = int(_lprof.get("exposure_us", DETECT_EXPOSURE_US))
+                                active_detect_gain        = float(_lprof.get("gain", DETECT_GAIN))
+                                adapt_margin              = float(_lprof.get("adapt_margin", adapt_margin))
+                                # Template locked: light the whole strip solid
+                                # white at full brightness for the duration of
+                                # DETECT (one static frame; no idle animation
+                                # runs in DETECT, and the win animation overrides
+                                # it on completion).
+                                if LED_AVAILABLE:
+                                    _spi_show(255, 255, 255)
                                 _auto_set(state="DETECT", locked=name)
                                 last_sig = None
                                 t_sig    = now
@@ -887,7 +1015,9 @@ def auto_loop():
                 if not ps:
                     with state_lock:
                         detection_running = False
-                    _auto_set(state="CLEAR_WAIT")
+                    # Drop the latch: the winning board is still full. We must
+                    # see it cleared before any new wake/win is allowed.
+                    _auto_set(state="CLEAR_WAIT", armed=False)
                     t_state = now
                 time.sleep(tick)
 
@@ -896,15 +1026,17 @@ def auto_loop():
                 if now - last_scan >= float(cfg["sleep_poll_s"]):
                     last_scan = now
                     _, filled, err = _scan_filled_holes(
-                        thresh=float(cfg["scan_threshold"]),
-                        exp=int(cfg["scan_exposure_us"]),
-                        gain=float(cfg["scan_gain"]))
+                        thresh=scan_thr, exp=scan_exp, gain=scan_gn)
                     if not err:
                         _auto_set(filled=len(filled))
                         if len(filled) < int(cfg["clear_threshold"]):
-                            _auto_set(state="COOLDOWN")
+                            # Board cleared: re-arm and proceed normally.
+                            _auto_set(state="COOLDOWN", armed=True)
                             t_state = now
                 if auto_state == "CLEAR_WAIT" and now - t_state >= float(cfg["clear_timeout_s"]):
+                    # Timed out with the board still full: leave CLEAR_WAIT so we
+                    # don't stick forever, but stay UN-armed so SLEEP won't
+                    # re-fire this uncleared completed board.
                     _auto_set(state="COOLDOWN")
                     t_state = now
                 time.sleep(tick)
@@ -976,7 +1108,7 @@ PAGE = """
           style="background:#363;color:#afa">🔭 Undistort: ON</button>
   <div class="sep"></div>
   <label>Focus
-    <input type="range" id="focusSlider" min="0" max="30" step="0.1" value="0"
+    <input type="range" id="focusSlider" min="0" max="32" step="0.1" value="0"
            style="width:110px;accent-color:#4af;vertical-align:middle"
            oninput="setFocus(this.value)">
     <span id="focusVal">auto</span>
@@ -1535,32 +1667,25 @@ PAGE = """
 
   function promptSaveTemplate() {
     document.getElementById('tmplDropdown').style.display = 'none';
-    const _msg = patternSet.size > 0
-      ? 'Save ' + patternSet.size + ' selected holes as template — enter name' + (editingTemplate ? ' (overwrites "' + editingTemplate + '")' : '') + ':'
-      : 'Template name (place template on board with no pegs, then enter name):';
-    const name = prompt(_msg, editingTemplate || '');
-    if (!name || !name.trim()) return;
-
-    if (patternSet.size > 0) {
-      // Save currently selected holes directly — no scan needed
-      setStatus('⏳ Saving template…');
-      fetch('/save_template_holes', {method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({name: name.trim(), holes: Array.from(patternSet)})}).then(r => r.json()).then(d => {
-        if (d.error) { setStatus('✗ ' + d.error); return; }
-        setStatus('✓ Saved template "' + d.name + '" with ' + d.hole_count + ' holes');
-        selectMode = false;
-        const btn = document.getElementById('btnSelectHoles');
-        btn.textContent = '🎯 Select Holes'; btn.style.background = '#444'; btn.style.color = '#fff';
-      }).catch(() => { setStatus('✗ Save failed'); });
-    } else {
-      // Fall back to ambient scan
-      setStatus('⏳ Scanning and saving template…');
-      fetch('/save_template', {method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({name: name.trim()})}).then(r => r.json()).then(d => {
-        if (d.error) { setStatus('✗ ' + d.error); return; }
-        setStatus('✓ Saved template "' + d.name + '" with ' + d.hole_count + ' holes');
-      }).catch(() => { setStatus('✗ Save failed'); });
+    // Templates are defined manually only — pick the pattern holes with
+    // 🎯 Select Holes first. (No ambient auto-detect: it's unreliable and
+    // template accuracy controls when a win fires.)
+    if (patternSet.size === 0) {
+      setStatus('✗ No holes selected — click 🎯 Select Holes and mark the pattern first');
+      return;
     }
+    const name = prompt('Save ' + patternSet.size + ' selected holes as template — enter name'
+      + (editingTemplate ? ' (overwrites "' + editingTemplate + '")' : '') + ':', editingTemplate || '');
+    if (!name || !name.trim()) return;
+    setStatus('⏳ Saving template…');
+    fetch('/save_template_holes', {method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({name: name.trim(), holes: Array.from(patternSet)})}).then(r => r.json()).then(d => {
+      if (d.error) { setStatus('✗ ' + d.error); return; }
+      setStatus('✓ Saved template "' + d.name + '" with ' + d.hole_count + ' holes');
+      selectMode = false;
+      const btn = document.getElementById('btnSelectHoles');
+      btn.textContent = '🎯 Select Holes'; btn.style.background = '#444'; btn.style.color = '#fff';
+    }).catch(() => { setStatus('✗ Save failed'); });
   }
 
   // ── Detection ──────────────────────────────────────
@@ -1958,7 +2083,12 @@ def _scan_filled_holes(thresh=None, exp=0, gain=0.0):
       results    = list of per-hole dicts (same shape the route returns)
       filled_set = set of hole indices with occupied==True
       err        = None on success, or (message, http_status) on failure
+
+    Side effect: when a fixed exposure is used (exp>0), records an
+    exposure-normalized ambient reading (mean IR-off luminance scaled to
+    LIGHT_REF_EXPOSURE_US) into auto_ambient, which drives day/night selection.
     """
+    global auto_ambient
     with state_lock:
         holes     = list(grid_holes)
         thr       = diff_threshold if thresh is None else thresh
@@ -2028,6 +2158,14 @@ def _scan_filled_holes(thresh=None, exp=0, gain=0.0):
         results.append({"index": i, "pixel_x": px, "pixel_y": py,
                         "lum": round(diff, 1), "on": round(l_on, 1),
                         "off": round(l_off, 1), "occupied": occupied})
+
+    # Record exposure-normalized ambient (IR-off level) for day/night selection.
+    # Luminance scales ~linearly with exposure below saturation, so dividing by
+    # the exposure used makes night-profile and day-profile readings comparable.
+    if exp > 0 and results:
+        off_mean = sum(r["off"] for r in results) / len(results)
+        auto_ambient = off_mean * (LIGHT_REF_EXPOSURE_US / float(exp))
+
     return results, filled, None
 
 
@@ -2200,7 +2338,7 @@ def set_led():
 @app.route("/set_focus")
 def set_focus():
     global focus_pos
-    pos = max(0.0, min(30.0, float(request.args.get("pos", 0))))
+    pos = max(0.0, min(32.0, float(request.args.get("pos", 0))))
     focus_pos = pos
     if pos <= 0:
         camera.set_controls({
@@ -2214,6 +2352,21 @@ def set_focus():
             "LensPosition": pos,
         })
     return jsonify({"lens_position": pos})
+
+@app.route("/focus_info")
+def focus_info():
+    """Read live camera metadata: AF-converged LensPosition + AfState.
+    Used to pick a sensible fixed-focus value to lock for repeatability."""
+    try:
+        md = camera.capture_metadata()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({
+        "lens_position": md.get("LensPosition"),
+        "af_state": md.get("AfState"),
+        "focus_fom": md.get("FocusFoM"),
+        "configured_focus": focus_pos,
+    })
 
 @app.route("/set_diff_threshold")
 def set_diff_threshold():
@@ -2232,6 +2385,56 @@ def set_adapt_margin():
         adapt_margin = val
     _save_settings("adapt_margin", val)
     return jsonify({"adapt_margin": val})
+
+@app.route("/set_win_fraction")
+def set_win_fraction():
+    """Fraction of pattern holes that must read filled to win (0.50-1.00)."""
+    global win_fraction
+    try:
+        val = float(request.args.get("val", 1.0))
+    except ValueError:
+        return jsonify({"error": "val must be a number"}), 400
+    val = max(0.50, min(1.0, val))
+    with state_lock:
+        win_fraction = val
+    _save_settings("win_fraction", val)
+    return jsonify({"win_fraction": val})
+
+@app.route("/set_light")
+def set_light():
+    """Tune day/night handling live (merged into settings.json 'light', read live).
+    Examples:
+      /set_light?mode=auto
+      /set_light?profile=day&exposure_us=4000&gain=1.0&adapt_margin=40&scan_threshold=30
+      /set_light?ambient_split=90&ambient_hysteresis=15
+      /set_light?mode=clock&day_start=07:00&night_start=19:00
+    """
+    lc = _light_cfg()
+    mode = request.args.get("mode")
+    if mode in ("auto", "day", "night", "clock", "clock_fallback"):
+        lc["mode"] = mode
+    for key in ("ambient_split", "ambient_hysteresis"):
+        if key in request.args:
+            try:
+                lc[key] = float(request.args.get(key))
+            except ValueError:
+                pass
+    for key in ("day_start", "night_start"):
+        if key in request.args:
+            lc[key] = request.args.get(key)
+    prof = request.args.get("profile")
+    if prof in ("day", "night"):
+        p = lc["profiles"].setdefault(prof, {})
+        for fld, cast in (("exposure_us", int), ("gain", float),
+                          ("scan_threshold", float), ("adapt_margin", float)):
+            if fld in request.args:
+                try:
+                    p[fld] = cast(request.args.get(fld))
+                except ValueError:
+                    pass
+    _save_settings("light", lc)
+    return jsonify({"light": lc, "active_profile": auto_light_profile,
+                    "ambient": round(auto_ambient, 1)})
 
 @app.route("/set_brightness_threshold")
 def set_brightness_threshold():
@@ -2365,6 +2568,7 @@ def detection_status():
         "max_diff":            max_diff,
         "threshold":           thresh,
         "adapt_margin":        am,
+        "win_fraction":        win_fraction,
         "inferred":            list(inf),
         "last_trigger":        lt,
         "auto_mode":           auto_mode,
@@ -2372,6 +2576,9 @@ def detection_status():
         "auto_locked":         auto_locked_template,
         "auto_filled":         auto_last_filled,
         "auto_wake_streak":    auto_wake_streak,
+        "auto_armed":          auto_armed,
+        "light_profile":       auto_light_profile,
+        "ambient":             round(auto_ambient, 1),
     })
 
 @app.route("/set_detection_strict")
@@ -2403,7 +2610,7 @@ def set_auto():
                             "have": sorted(names)}), 400
         auto_mode = True
         _save_settings("auto_mode", True)
-        _auto_set(state="SLEEP", locked=None, filled=0, streak=0)
+        _auto_set(state="SLEEP", locked=None, filled=0, streak=0, armed=True)
     else:
         auto_mode = False
         _save_settings("auto_mode", False)
@@ -2414,7 +2621,7 @@ def set_auto():
         camera.set_controls({"AeEnable": True})
         if LED_AVAILABLE:
             _spi_show(*led_color)
-        _auto_set(state="SLEEP", locked=None)
+        _auto_set(state="SLEEP", locked=None, armed=True)
     return jsonify({"auto_mode": auto_mode, "auto_state": auto_state})
 
 @app.route("/reset_puzzle")
