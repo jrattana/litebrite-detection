@@ -36,10 +36,10 @@
         "adapt_margin": 35
       },
       "night": {
-        "exposure_us": 12000,
+        "exposure_us": 5000,
         "gain": 1.0,
         "scan_threshold": 30,
-        "adapt_margin": 35
+        "adapt_margin": 15
       }
     }
   },
