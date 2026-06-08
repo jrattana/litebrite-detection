@@ -1194,6 +1194,11 @@ PAGE = """
     const f = parseFloat(v);
     document.getElementById('focusVal').textContent = f === 0 ? 'auto' : f.toFixed(1) + ' D';
     fetch('/set_focus?pos=' + f);
+    // Focus changes magnification → moves the holes. If a grid is already built
+    // at a different focus, warn that it must be recomputed before saving.
+    if (holeState.length > 0 && gridFocus !== null && Math.abs(f - gridFocus) > 0.05) {
+      setStatus('⚠ Focus changed (grid was built at ' + gridFocus.toFixed(1) + ' D) — redraw lines & Compute Grid before saving, or the grid won’t match.');
+    }
   }
   function onThreshChange(v) {
     document.getElementById('threshVal').textContent = v;
@@ -1262,6 +1267,7 @@ PAGE = """
   let lineStart    = null; // first click of the line being drawn
   let mousePos     = null; // current cursor for live preview
   let holeState    = [];   // [{px,py,occupied,idx}, …]
+  let gridFocus    = null; // focus (D) the current grid was built at; null = unknown/no grid
 
   // ── Pattern / Detection state ──────────────────────
   let patternMode   = false;
@@ -1409,6 +1415,7 @@ PAGE = """
       if (d.error) { setStatus('✗ ' + d.error); return; }
       holeState = d.holes.map((h, i) => ({ px: h.px, py: h.py, occupied: null, idx: i }));
       patternSet.clear();
+      gridFocus = parseFloat(document.getElementById('focusSlider').value);  // grid is valid at the current focus
       setStatus('✓ ' + d.count + ' holes mapped — click 🎯 Select Holes to define a template');
       document.getElementById('btnScan').style.display         = 'none';
       document.getElementById('tmplDropWrap').style.display    = '';
@@ -1440,6 +1447,7 @@ PAGE = """
         document.getElementById('focusSlider').value = d.focus;
         document.getElementById('focusVal').textContent =
           d.focus === 0 ? 'auto' : d.focus.toFixed(1) + ' D';
+        gridFocus = parseFloat(d.focus);  // loaded grid matches its saved focus
       }
       document.getElementById('btnSaveCalib').style.display = '';
       document.getElementById('nudgeWrap').style.display = 'inline-flex';
@@ -1454,9 +1462,23 @@ PAGE = """
   }
 
   function saveCalibration() {
+    // Block saving a grid that was built at a different focus than is now set —
+    // the saved grid would not match the saved focus.
+    if (holeState.length > 0 && gridFocus !== null) {
+      const f = parseFloat(document.getElementById('focusSlider').value);
+      if (Math.abs(f - gridFocus) > 0.05) {
+        const fl = f === 0 ? 'auto' : f.toFixed(1) + ' D';
+        if (!confirm('Focus is now ' + fl + ' but the grid was built at ' + gridFocus.toFixed(1) +
+                     ' D.\nThe saved grid will NOT match this focus. Recompute the grid first.\n\nSave anyway?')) {
+          setStatus('✋ Save cancelled — redraw lines & Compute Grid at the current focus.');
+          return;
+        }
+      }
+    }
     setStatus('⏳ Saving calibration + camera settings…');
     fetch('/save_calibration', {method:'POST'}).then(r => r.json()).then(d => {
       if (d.error) { setStatus('✗ ' + d.error); return; }
+      gridFocus = parseFloat(d.focus);  // committed state: grid now matches saved focus
       const f = d.focus === 0 ? 'auto' : d.focus.toFixed(1) + ' D';
       setStatus('💾 Saved ' + d.count + ' holes  ·  FOV ' + d.fov_pct + '%  ·  focus ' + f +
                 '  ·  undistort ' + (d.undistort_on ? 'ON' : 'OFF'));
