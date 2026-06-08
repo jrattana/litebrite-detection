@@ -22,20 +22,6 @@ LED_OFFSET = 0   # new WS2815 strip: drive from the first LED
 LED_COUNT  = 30   # WS2811 diffuse strip (~44 in); 30 addressable pixels, measured via /count_ruler
 led_color  = (0, 0, 0)   # last colour set via /set_led; restored after the win sequence
 
-def _encode_color_byte(v):
-    """Encode one 8-bit color channel into 3 SPI bytes (3 SPI bits per WS bit)."""
-    # Bit layout (MSB first): [1 b7 0][1 b6 0][1 b5 0][1 b4 0][1 b3 0][1 b2 0][1 b1 0][1 b0 0]
-    # = 24 bits packed into 3 bytes
-    return [
-        0x92 | (((v >> 7) & 1) << 6) | (((v >> 6) & 1) << 3) | ((v >> 5) & 1),
-        0x49 | (((v >> 4) & 1) << 5) | (((v >> 3) & 1) << 2),
-        0x24 | (((v >> 2) & 1) << 7) | (((v >> 1) & 1) << 4) | ((v & 1) << 1),
-    ]
-
-def _encode_pixel(r, g, b):
-    """Return 9 SPI bytes for one GRB WS2815 pixel."""
-    return _encode_color_byte(g) + _encode_color_byte(r) + _encode_color_byte(b)
-
 # LED strip driver — Pi 5 RP1 PIO (hardware-timed WS281x), NOT SPI.
 # Data on board.D13 (GPIO13 / physical pin 33). Byte order is RGB.
 # The function names below keep the historical _spi_* prefix so the rest of
@@ -125,7 +111,6 @@ def _save_settings(key, value):
 _settings = _load_settings()
 diff_threshold     = _settings.get("diff_threshold", 20)   # absolute thr, used by /scan_holes diagnostic
 adapt_margin       = _settings.get("adapt_margin", 30)     # live detection: margin above local background = filled
-last_scan_results  = []   # most recent scan_holes result list
 
 # ── Template store ────────────────────────────────────
 TEMPLATES_FILE = "/home/jerica/templates.json"
@@ -403,15 +388,6 @@ def capture_loop():
 threading.Thread(target=capture_loop, daemon=True).start()
 
 
-def _hole_lum(img, px, py, half=4):
-    h, w = img.shape[:2]
-    x1, y1 = max(0, px - half), max(0, py - half)
-    x2, y2 = min(w, px + half), min(h, py + half)
-    crop = img[y1:y2, x1:x2]
-    return float(np.mean(0.299*crop[:,:,0] + 0.587*crop[:,:,1]
-                         + 0.114*crop[:,:,2])) if crop.size else 0.0
-
-
 def _wheel(pos):
     """Rainbow colour wheel: pos 0-255 → (r, g, b)."""
     pos = pos % 256
@@ -653,7 +629,7 @@ def detection_loop():
             # half the lattice step so a window can never reach an adjacent hole.
             _lon  = (0.299 * img_on[..., 0]  + 0.587 * img_on[..., 1]  + 0.114 * img_on[..., 2]).astype(np.float32)
             _loff = (0.299 * img_off[..., 0] + 0.587 * img_off[..., 1] + 0.114 * img_off[..., 2]).astype(np.float32)
-            dimg  = cv2.blur(_lon - _loff, (9, 9))   # ~8x8 patch mean, matches _hole_lum
+            dimg  = cv2.blur(_lon - _loff, (9, 9))   # ~8x8 patch mean (center-patch luminance)
             _H, _W = dimg.shape
             SEARCH_R = int(max(3, min(0.35 * col_dx, 0.45 * col_dx)))
             diffs = {}
@@ -1137,7 +1113,6 @@ PAGE = """
   <button id="btnDone" onclick="phaseDone()" style="display:none;background:#363;color:#afa">✓ Done</button>
   <span id="calibStatus" style="font-size:12px;color:#fa0;"></span>
   <button id="btnScan" onclick="scanHoles()" style="display:none;background:#26a;color:#fff">🔍 Scan</button>
-  <button id="btnDetectTmpl" onclick="detectTemplate()" style="display:none;background:#0a5;color:#fff;font-weight:bold">🔍 Detect Template</button>
   <div id="tmplDropWrap" style="position:relative;display:none">
     <button onclick="toggleTmplDropdown()" style="background:#444;color:#fff">📋 Templates ▾</button>
     <div id="tmplDropdown" style="display:none;position:absolute;top:100%;left:0;background:#222;
@@ -1285,7 +1260,6 @@ PAGE = """
   let lineStart    = null; // first click of the line being drawn
   let mousePos     = null; // current cursor for live preview
   let holeState    = [];   // [{px,py,occupied,idx}, …]
-  let triangleData = [];   // [{orientation,corners,pegs}, …] from last detect
 
   // ── Pattern / Detection state ──────────────────────
   let patternMode   = false;
@@ -1297,11 +1271,10 @@ PAGE = """
 
   function startCalib() {
     calibPhase = PHASE_ROW_LINES;
-    rowLines = []; colLines = []; lineStart = null; holeState = []; triangleData = [];
+    rowLines = []; colLines = []; lineStart = null; holeState = [];
     wrap.classList.add('calib-mode');
     document.getElementById('btnDone').style.display         = '';
     document.getElementById('btnScan').style.display         = 'none';
-    document.getElementById('btnTriangle').style.display     = 'none';
     document.getElementById('btnClearGrid').style.display    = 'none';
     setStatus('① Draw ROW lines — click two points along each row of holes, then ✓ Done');
     redrawOverlay();
@@ -1328,13 +1301,12 @@ PAGE = """
     if (detectRunning) { fetch('/stop_detection'); detectRunning = false; }
     if (detectPollId)  { clearInterval(detectPollId); detectPollId = null; }
     calibPhase = PHASE_NONE;
-    rowLines = []; colLines = []; lineStart = null; holeState = []; triangleData = [];
+    rowLines = []; colLines = []; lineStart = null; holeState = [];
     patternSet = new Set(); patternMode = false;
     loadedTemplateName = null; liveState = {}; wasSolved = false;
     wrap.classList.remove('calib-mode');
     document.getElementById('btnDone').style.display           = 'none';
     document.getElementById('btnScan').style.display           = 'none';
-    document.getElementById('btnDetectTmpl').style.display     = 'none';
     document.getElementById('tmplDropWrap').style.display      = 'none';
     document.getElementById('btnSelectHoles').style.display    = 'none';
     document.getElementById('btnDetect').style.display         = 'none';
@@ -1433,10 +1405,9 @@ PAGE = """
       body: JSON.stringify({ row_lines: rowLines.map(toImg), col_lines: colLines.map(toImg) })
     }).then(r => r.json()).then(d => {
       holeState = d.holes.map((h, i) => ({ px: h.px, py: h.py, occupied: null, idx: i }));
-      triangleData = []; patternSet.clear();
-      setStatus('✓ ' + d.count + ' holes mapped — click 🔍 Detect Template');
+      patternSet.clear();
+      setStatus('✓ ' + d.count + ' holes mapped — click 🎯 Select Holes to define a template');
       document.getElementById('btnScan').style.display         = 'none';
-      document.getElementById('btnDetectTmpl').style.display   = '';
       document.getElementById('tmplDropWrap').style.display    = '';
       document.getElementById('btnSelectHoles').style.display  = '';
       document.getElementById('btnDetect').style.display       = 'none';
@@ -1450,7 +1421,7 @@ PAGE = """
     fetch('/load_saved_grid').then(r => r.json()).then(d => {
       if (d.error) { setStatus('✗ ' + d.error); return; }
       holeState = d.holes.map((h, i) => ({ px: h.px, py: h.py, occupied: null, idx: i }));
-      triangleData = []; patternSet.clear();
+      patternSet.clear();
       // ── Sync stream-control UI to the restored camera settings ──
       if (d.fov_pct !== undefined) {
         document.getElementById('fov').value = d.fov_pct;
@@ -1469,9 +1440,8 @@ PAGE = """
       }
       document.getElementById('btnSaveCalib').style.display = '';
       document.getElementById('nudgeWrap').style.display = 'inline-flex';
-      setStatus('✓ ' + d.count + ' holes loaded — click 🔍 Detect Template');
+      setStatus('✓ ' + d.count + ' holes loaded — click 🎯 Select Holes to define a template');
       document.getElementById('btnScan').style.display         = 'none';
-      document.getElementById('btnDetectTmpl').style.display   = '';
       document.getElementById('tmplDropWrap').style.display    = '';
       document.getElementById('btnSelectHoles').style.display  = '';
       document.getElementById('btnDetect').style.display       = 'none';
@@ -1520,32 +1490,13 @@ PAGE = """
     setStatus('⏳ Scanning…');
     fetch('/scan_holes').then(r => r.json()).then(d => {
       holeState = d.holes.map(h => ({ px: h.pixel_x, py: h.pixel_y, occupied: h.occupied, idx: h.index }));
-      triangleData = [];
       const occ = d.holes.filter(h => h.occupied).length;
       setStatus('✓ ' + occ + ' / ' + d.count + ' occupied  (avg IR diff: ' + d.avg_diff + ')');
-      document.getElementById('btnTriangle').style.display = '';
       redrawOverlay();
     }).catch(() => { setStatus('✗ Scan failed'); });
   }
 
-  function detectTriangles() {
-    setStatus('⏳ Detecting triangles…');
-    fetch('/detect_triangles').then(r => r.json()).then(d => {
-      if (d.error) { setStatus('✗ ' + d.error); return; }
-      triangleData = d.triangles;
-      if (d.count === 0) {
-        setStatus('No triangles found');
-      } else {
-        const ups   = d.triangles.filter(t => t.orientation === 'up').length;
-        const downs = d.triangles.filter(t => t.orientation === 'down').length;
-        setStatus('🔺 ' + d.count + ' triangle' + (d.count > 1 ? 's' : '') +
-                  ' found  (' + ups + '▲  ' + downs + '▽)');
-      }
-      redrawOverlay();
-    }).catch(() => { setStatus('✗ Triangle detection failed'); });
-  }
-
-  // ── Template detection & hole selection ─────────
+  // ── Template hole selection ─────────
   let loadedTemplateName = null;
   let selectMode = false;
   let editingTemplate = null;   // name of template currently being edited (for overwrite-save)
@@ -1569,28 +1520,6 @@ PAGE = """
       }
     }
     redrawOverlay();
-  }
-
-  function detectTemplate() {
-    setStatus('⏳ Scanning for template…');
-    fetch('/detect_template').then(r => r.json()).then(d => {
-      if (d.error) { setStatus('✗ ' + d.error); return; }
-      if (!d.hole_count) {
-        setStatus('⚠ No template detected — place template on board and try again');
-        return;
-      }
-      loadedTemplateName = d.match ? d.match.name : null;
-      // Update patternSet for overlay rendering
-      patternSet = new Set(d.open_holes);
-      holeState.forEach(h => { h.occupied = null; });
-      if (d.match) {
-        setStatus('✓ ' + d.match.name + ' detected (' + Math.round(d.match.score*100) + '% match) — ' + d.hole_count + ' holes  →  click ▶ Detect');
-      } else {
-        setStatus('✓ Template detected — ' + d.hole_count + ' holes (no saved match)  →  click ▶ Detect');
-      }
-      document.getElementById('btnDetect').style.display = '';
-      redrawOverlay();
-    }).catch(() => { setStatus('✗ Detect failed'); });
   }
 
   function toggleTmplDropdown() {
@@ -1880,31 +1809,6 @@ PAGE = """
         }
         drawDot(ctx, x, y, color, r);
       });
-
-      // Triangle outlines
-      if (triangleData.length > 0) {
-        ctx.setLineDash([]);
-        triangleData.forEach(tri => {
-          const c  = tri.corners;
-          const c0 = [c[0][0] * sx, c[0][1] * sy];
-          const c1 = [c[1][0] * sx, c[1][1] * sy];
-          const c2 = [c[2][0] * sx, c[2][1] * sy];
-          // Glow / shadow
-          ctx.lineWidth   = 5;
-          ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-          ctx.beginPath();
-          ctx.moveTo(c0[0], c0[1]); ctx.lineTo(c1[0], c1[1]);
-          ctx.lineTo(c2[0], c2[1]); ctx.closePath(); ctx.stroke();
-          // Bright outline
-          ctx.lineWidth   = 2.5;
-          ctx.strokeStyle = tri.orientation === 'up'
-                          ? 'rgba(255,220,0,0.95)'    // yellow for ▲
-                          : 'rgba(0,220,255,0.95)';   // cyan for ▽
-          ctx.beginPath();
-          ctx.moveTo(c0[0], c0[1]); ctx.lineTo(c1[0], c1[1]);
-          ctx.lineTo(c2[0], c2[1]); ctx.closePath(); ctx.stroke();
-        });
-      }
     }
   }
 </script>
@@ -2171,7 +2075,6 @@ def _scan_filled_holes(thresh=None, exp=0, gain=0.0):
 
 @app.route("/scan_holes")
 def scan_holes():
-    global last_scan_results
     if auto_state == "DETECT":
         return jsonify({"error": "auto detection in progress"}), 409
     try:
@@ -2190,137 +2093,8 @@ def scan_holes():
     avg_diff = round(sum(r["lum"] for r in results) / len(results), 1) if results else 0.0
     sat = sum(1 for r in results if r["on"] >= 250)
     max_on = max((r["on"] for r in results), default=0.0)
-    with state_lock:
-        last_scan_results = list(results)
     return jsonify({"holes": results, "count": len(results), "avg_diff": avg_diff,
                     "saturated": sat, "max_on": max_on, "exp": _exp, "gain": _gain})
-
-
-def find_triangles_in_grid(holes, results, side_len=2):
-    """
-    Find equilateral triangles of 3 occupied pegs on the isometric grid.
-
-    Uses a pure-geometry approach: for every pair of occupied pegs that are
-    approximately one lattice step apart, compute the two candidate equilateral
-    third vertices (±60° rotation) and check whether an occupied peg sits there.
-    No lattice-direction estimation needed — just distance + rotation.
-
-    Returns a list of dicts:
-        { "orientation": "up"|"down",
-          "corners": [[px,py],[px,py],[px,py]],   # image-pixel coords
-          "pegs":    [list of hole indices] }
-    """
-    if not results or not holes:
-        return []
-
-    occupied = [(r["pixel_x"], r["pixel_y"], r["index"])
-                for r in results if r["occupied"]]
-    if len(occupied) < 3:
-        return []
-
-    # ── Estimate lattice step (col_dx) from calibration holes ─────────────────
-    # Bin holes by y, find median x-spacing within each row bin
-    bins = {}
-    for h in holes:
-        k = int(round(h["py"] / 20))
-        bins.setdefault(k, []).append(h["px"])
-    col_dxs = []
-    for xs in bins.values():
-        xs_s = sorted(xs)
-        for j in range(len(xs_s) - 1):
-            d = xs_s[j+1] - xs_s[j]
-            if d > 5:
-                col_dxs.append(d)
-    col_dx = float(np.median(col_dxs)) if col_dxs else 50.0
-
-    SNAP = col_dx * 0.38   # ±38% tolerance on third-vertex position
-
-    # ── Spatial hash for fast nearest-occupied lookup ─────────────────────────
-    cell_sz = max(int(SNAP / 2), 1)
-
-    def cell_key(x, y):
-        return (int(x / cell_sz), int(y / cell_sz))
-
-    occ_cells = {}
-    for px, py, idx in occupied:
-        occ_cells[cell_key(px, py)] = (px, py, idx)
-
-    def find_near(x, y, exclude_a=-1, exclude_b=-1):
-        """Occupied hole nearest (x,y) within SNAP, excluding two indices."""
-        cx, cy = cell_key(x, y)
-        best_idx, best_dist = -1, SNAP
-        for ddx in range(-2, 3):
-            for ddy in range(-2, 3):
-                entry = occ_cells.get((cx + ddx, cy + ddy))
-                if not entry:
-                    continue
-                hx, hy, hidx = entry
-                if hidx == exclude_a or hidx == exclude_b:
-                    continue
-                d = ((hx - x) ** 2 + (hy - y) ** 2) ** 0.5
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = hidx
-        return best_idx
-
-    # Build a quick index: result_index -> (px, py)
-    idx_to_pt = {r["index"]: (r["pixel_x"], r["pixel_y"])
-                 for r in results if r["occupied"]}
-
-    # ── Check every pair of occupied pegs ~one lattice step apart ─────────────
-    triangles, seen = [], set()
-
-    for i in range(len(occupied)):
-        ax, ay, ai = occupied[i]
-        for j in range(i + 1, len(occupied)):
-            bx, by, bi = occupied[j]
-            dx, dy = bx - ax, by - ay
-            dist = (dx * dx + dy * dy) ** 0.5
-
-            # Only consider nearest-neighbour pairs (within ±45% of col_dx)
-            if dist < col_dx * 0.55 or dist > col_dx * 1.45:
-                continue
-
-            # Two candidate equilateral third vertices (±60° rotation of AB)
-            for sign in (1, -1):
-                cx = ax + 0.5 * dx - sign * 0.866 * dy
-                cy = ay + sign * 0.866 * dx + 0.5 * dy
-                ci = find_near(cx, cy, exclude_a=ai, exclude_b=bi)
-                if ci < 0:
-                    continue
-
-                key = frozenset([ai, bi, ci])
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                cpx, cpy = idx_to_pt[ci]
-
-                # Orientation: apex above midpoint → "up" (▲), else "down" (▽)
-                mid_y = (ay + by) / 2.0
-                orient = "up" if cpy < mid_y else "down"
-
-                triangles.append({
-                    "orientation": orient,
-                    "corners": [[ax, ay], [bx, by], [cpx, cpy]],
-                    "pegs":    sorted([ai, bi, ci]),
-                })
-
-    return triangles
-
-
-@app.route("/detect_triangles")
-def detect_triangles():
-    global last_scan_results
-    with state_lock:
-        holes   = list(grid_holes)
-        results = list(last_scan_results)
-    if not holes:
-        return jsonify({"error": "Not calibrated"}), 400
-    if not results:
-        return jsonify({"error": "No scan data — run Scan first"}), 400
-    tris = find_triangles_in_grid(holes, results, side_len=2)
-    return jsonify({"triangles": tris, "count": len(tris)})
 
 
 @app.route("/set_led")
@@ -2367,15 +2141,6 @@ def focus_info():
         "focus_fom": md.get("FocusFoM"),
         "configured_focus": focus_pos,
     })
-
-@app.route("/set_diff_threshold")
-def set_diff_threshold():
-    global diff_threshold
-    val = max(0, min(255, int(request.args.get("val", 20))))
-    with state_lock:
-        diff_threshold = val
-    _save_settings("diff_threshold", val)
-    return jsonify({"diff_threshold": val})
 
 @app.route("/set_adapt_margin")
 def set_adapt_margin():
@@ -2480,16 +2245,6 @@ def toggle_pattern_node():
             target_pattern.add(idx)
             state = "added"
     return jsonify({"idx": idx, "state": state, "count": len(target_pattern)})
-
-@app.route("/clear_pattern")
-def clear_pattern():
-    global target_pattern, consecutive_matches, puzzle_solved
-    with state_lock:
-        target_pattern     = set()
-        consecutive_matches = 0
-        puzzle_solved       = False
-    _set_current_template(None)
-    return jsonify({"ok": True})
 
 @app.route("/set_target_pattern", methods=["POST"])
 def set_target_pattern():
@@ -2671,144 +2426,6 @@ def get_templates():
         "hole_count": len(t["holes"]),
         "created":    t.get("created", ""),
     } for t in templates])
-
-
-def _scan_ambient():
-    """
-    Take an ambient (IR-off) frame and return per-hole luminance list.
-    Returns (lum_list, error_str). error_str is None on success.
-    """
-    with state_lock:
-        holes = list(grid_holes)
-    if not holes:
-        return None, "Not calibrated"
-    if IR_AVAILABLE:
-        ir_led.off()
-    time.sleep(0.15)
-    with frame_lock:
-        frame = latest_frame
-    if not frame:
-        return None, "No frame"
-    img = np.array(Image.open(io.BytesIO(frame)))
-    lums = [_hole_lum(img, int(round(h["px"])), int(round(h["py"]))) for h in holes]
-    return lums, None
-
-
-def _classify_open_holes(lum_list):
-    """
-    Use Otsu thresholding on hole luminance to find open (dark) holes.
-    Returns (open_hole_indices, threshold_value).
-    Returns ([], 0) if variance is too low (no template present).
-    """
-    arr = np.array(lum_list, dtype=np.float32)
-    if arr.std() < 6.0:
-        return [], 0.0
-    # Normalise to 0-255 for Otsu
-    mn, mx = arr.min(), arr.max()
-    if mx == mn:
-        return [], 0.0
-    u8 = ((arr - mn) / (mx - mn) * 255).astype(np.uint8).reshape(1, -1)
-    otsu_u8, _ = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thresh = float(otsu_u8) / 255.0 * (mx - mn) + mn
-    open_holes = [i for i, l in enumerate(lum_list) if l < thresh]
-    return open_holes, round(float(thresh), 1)
-
-
-@app.route("/detect_template")
-def detect_template_route():
-    """
-    Scan ambient frame, detect open holes (template cutouts) via Otsu,
-    match against stored templates, auto-load best match as target pattern.
-    """
-    global target_pattern, consecutive_matches, puzzle_solved
-    if auto_state == "DETECT":
-        return jsonify({"error": "auto detection in progress"}), 409
-    lums, err = _scan_ambient()
-    if err:
-        return jsonify({"error": err}), (400 if err == "Not calibrated" else 503)
-
-    open_holes, thresh = _classify_open_holes(lums)
-    if not open_holes:
-        return jsonify({
-            "open_holes": [], "hole_count": 0,
-            "match": None, "all_matches": [],
-            "msg": "No template detected — board appears uniform",
-        })
-
-    # Match against stored templates
-    templates = _load_templates()
-    matches = []
-    open_set = set(open_holes)
-    for tmpl in templates:
-        tmpl_set = set(tmpl["holes"])
-        if not tmpl_set and not open_set:
-            score = 1.0
-        elif not tmpl_set or not open_set:
-            score = 0.0
-        else:
-            intersection = len(tmpl_set & open_set)
-            union        = len(tmpl_set | open_set)
-            score = intersection / union if union > 0 else 0.0
-        matches.append({"name": tmpl["name"], "score": round(score, 3)})
-
-    matches.sort(key=lambda x: -x["score"])
-    best_match = matches[0] if matches and matches[0]["score"] >= 0.7 else None
-
-    # Load matched template's holes (or use detected open holes if no match)
-    if best_match:
-        tmpl_holes = next(
-            (t["holes"] for t in templates if t["name"] == best_match["name"]),
-            open_holes,
-        )
-    else:
-        tmpl_holes = open_holes
-
-    with state_lock:
-        target_pattern      = set(tmpl_holes)
-        consecutive_matches = 0
-        puzzle_solved       = False
-    _set_current_template(best_match["name"] if best_match else None)
-
-    return jsonify({
-        "open_holes":  open_holes,
-        "hole_count":  len(open_holes),
-        "match":       best_match,
-        "all_matches": matches,
-        "lum_thresh":  thresh,
-    })
-
-
-@app.route("/save_template", methods=["POST"])
-def save_template():
-    """
-    Save current ambient scan as a named template.
-    Body: {"name": "Butterfly"}
-    """
-    if auto_state == "DETECT":
-        return jsonify({"error": "auto detection in progress"}), 409
-    data = request.get_json() or {}
-    name = data.get("name", "").strip()
-    if not name:
-        return jsonify({"error": "Name required"}), 400
-
-    lums, err = _scan_ambient()
-    if err:
-        return jsonify({"error": err}), (400 if err == "Not calibrated" else 503)
-
-    open_holes, thresh = _classify_open_holes(lums)
-    if not open_holes:
-        return jsonify({"error": "No template detected — place template on board first"}), 400
-
-    templates = _load_templates()
-    templates = [t for t in templates if t["name"] != name]  # replace if exists
-    templates.append({
-        "name":    name,
-        "holes":   open_holes,
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    })
-    _save_templates_to_disk(templates)
-
-    return jsonify({"ok": True, "name": name, "hole_count": len(open_holes)})
 
 
 @app.route("/save_template_holes", methods=["POST"])
