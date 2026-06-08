@@ -1126,6 +1126,8 @@ PAGE = """
   <button id="btnSelectHoles" onclick="toggleSelectMode()" style="display:none;background:#444;color:#fff">🎯 Select Holes</button>
   <button id="btnDetect" onclick="toggleDetection()" style="display:none;background:#444;color:#fff">▶ Detect</button>
   <span id="detectBar" style="font-size:12px;color:#afa;font-family:monospace;white-space:nowrap;"></span>
+  <button id="btnFsm" onclick="toggleFsm()" style="background:#444;color:#fff" title="Autonomous sleep→detect→win controller. Turn OFF before calibrating.">⏻ FSM: OFF</button>
+  <span id="autoChip" style="font-size:12px;font-weight:bold;font-family:monospace;white-space:nowrap;padding:3px 10px;border-radius:11px;display:none"></span>
   <button id="btnClearGrid" onclick="clearGrid()" style="display:none;background:#444;color:#fff">✕</button>
   <div class="sep"></div>
   <label>IR Sensitivity
@@ -1404,6 +1406,7 @@ PAGE = """
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ row_lines: rowLines.map(toImg), col_lines: colLines.map(toImg) })
     }).then(r => r.json()).then(d => {
+      if (d.error) { setStatus('✗ ' + d.error); return; }
       holeState = d.holes.map((h, i) => ({ px: h.px, py: h.py, occupied: null, idx: i }));
       patternSet.clear();
       setStatus('✓ ' + d.count + ' holes mapped — click 🎯 Select Holes to define a template');
@@ -1699,6 +1702,66 @@ PAGE = """
     });
   }
 
+  // ── Always-on auto-mode status chip + live overlay ─────────────────────
+  // Runs regardless of manual ▶ Detect so auto mode shows the detected
+  // template and live red→green hole fill with no operator interaction.
+  let fsmOn = false;
+  function toggleFsm() {
+    const turnOn = !fsmOn;
+    fetch('/set_auto?on=' + (turnOn ? '1' : '0')).then(r => r.json()).then(d => {
+      if (d.error) { setStatus('✗ FSM: ' + d.error); return; }
+      setStatus(d.auto_mode ? '🤖 FSM ON — autonomous' : '⏹ FSM OFF — safe to calibrate');
+    }).catch(() => setStatus('✗ FSM toggle failed'));
+  }
+
+  function pollAuto() {
+    fetch('/detection_status').then(r => r.json()).then(d => {
+      // Keep the FSM button in sync regardless of on/off
+      fsmOn = !!d.auto_mode;
+      const btn = document.getElementById('btnFsm');
+      if (btn) {
+        btn.textContent     = fsmOn ? '🤖 FSM: ON' : '⏻ FSM: OFF';
+        btn.style.background = fsmOn ? '#1b5e20' : '#444';
+        btn.style.color      = '#fff';
+      }
+      const chip = document.getElementById('autoChip');
+      if (!d.auto_mode) { chip.style.display = 'none'; return; }
+      chip.style.display = '';
+      const st = d.auto_state;
+      let label, bg;
+      if (st === 'DETECT') {
+        label = '🔍 ' + (d.auto_locked || '?') + ' — ' + (d.live_matched || 0) + '/' + d.pattern_count + ' filled';
+        bg = '#1b5e20';
+      } else if (st === 'IDENTIFY') {
+        label = '👀 Identifying…'; bg = '#5d4037';
+      } else if (st === 'WIN') {
+        label = '🎉 WIN — ' + (d.auto_locked || ''); bg = '#1565c0';
+      } else if (st === 'CLEAR_WAIT') {
+        label = '🧹 Clear board to re-arm'; bg = '#455a64';
+      } else if (st === 'COOLDOWN') {
+        label = '⏳ Cooldown…'; bg = '#455a64';
+      } else {
+        label = '😴 Sleeping'; bg = '#37474f';
+      }
+      chip.textContent = label;
+      chip.style.background = bg;
+      chip.style.color = '#fff';
+
+      // Drive the live red/green overlay during auto detection, but don't
+      // fight the manual poller when a manual ▶ Detect is in progress.
+      if (!detectRunning) {
+        liveState = {};
+        inferredSet = new Set();
+        if (st === 'DETECT' || st === 'WIN') {
+          for (const [k, v] of Object.entries(d.live_state || {})) liveState[parseInt(k)] = v;
+          inferredSet = new Set((d.inferred || []).map(Number));
+        }
+        redrawOverlay();
+      }
+    }).catch(() => {});
+  }
+  setInterval(pollAuto, 400);
+
   function setStrict(on) {
     fetch('/set_detection_strict?on=' + (on ? '1' : '0'));
   }
@@ -1843,6 +1906,8 @@ def toggle_undistort():
 @app.route("/set_grid_from_lines", methods=["POST"])
 def set_grid_from_lines():
     global grid_holes
+    if auto_mode:
+        return jsonify({"error": "Turn FSM off before calibrating"}), 409
     data      = request.get_json()
     row_lines = data["row_lines"]   # list of [[x1,y1],[x2,y2]] in image pixels
     col_lines = data["col_lines"]
@@ -1943,6 +2008,8 @@ def nudge_grid():
 def save_calibration():
     """Re-save the currently-loaded grid plus current camera settings (new format)."""
     global grid_holes
+    if auto_mode:
+        return jsonify({"error": "Turn FSM off before calibrating"}), 409
     with state_lock:
         holes = list(grid_holes)
     if not holes:
